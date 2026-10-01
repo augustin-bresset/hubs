@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unisson — bêta</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Unisson <small>bêta</small></h1>
+    <span id="net" class="pill">connexion…</span>
+  </header>
+
+  <main>
+    <section class="card" id="joinCard">
+      <label for="name">Nom de cet appareil</label>
+      <div class="row">
+        <input id="name" maxlength="40" autocomplete="off">
+        <button id="join" class="primary">Rejoindre</button>
+      </div>
+      <p class="hint">Active le son sur cet appareil. À faire sur chaque appareil, chacun branché (ou non) sur son enceinte Bluetooth.</p>
+      <p class="hint" id="phoneUrl"></p>
+    </section>
+
+    <section class="card" id="playCard" hidden>
+      <h2>Lecture</h2>
+      <div class="row">
+        <select id="source"></select>
+        <label class="filebtn">Envoyer un fichier<input id="file" type="file" accept="audio/*" hidden></label>
+      </div>
+      <div class="row">
+        <button id="play" class="primary">Lecture</button>
+        <button id="pause">Pause</button>
+        <button id="stop">Stop</button>
+        <span id="pos" class="mono"></span>
+      </div>
+      <p class="hint" id="playHint"></p>
+    </section>
+
+    <section class="card" id="devicesCard" hidden>
+      <h2>Appareils</h2>
+      <div id="devices"></div>
+      <p class="hint">Compensation = avance appliquée au son de l'appareil pour rattraper sa latence. Les boutons permettent de l'ajuster à l'oreille, y compris à distance.</p>
+    </section>
+
+    <section class="card" id="calibCard" hidden>
+      <h2>Calibration au micro</h2>
+      <p class="hint">Cet appareil écoute : chaque appareil émet tour à tour trois signaux brefs, et la latence de chacun est mesurée par le même micro. Pose les enceintes à distance comparable du micro, sans musique ni bruit fort.</p>
+      <div class="row">
+        <button id="calibrate" class="primary">Calibrer (cet appareil écoute)</button>
+        <button id="verify">Vérifier</button>
+        <button id="stability">Test de stabilité</button>
+        <button id="releaseMic" hidden>Libérer le micro</button>
+      </div>
+      <p class="hint" id="micInfo"></p>
+      <div id="calibResult"></div>
+      <p class="hint" id="stabilitySummary"></p>
+      <details id="historyBox" hidden open>
+        <summary>Historique des mesures</summary>
+        <pre id="history"></pre>
+      </details>
+    </section>
+
+    <section class="card" id="logCard" hidden>
+      <details>
+        <summary>Journal</summary>
+        <pre id="log"></pre>
+      </details>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
