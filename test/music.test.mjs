@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PROBE, fft, makeBandstop, MusicAnalyzer, GapTracker } from '../public/dsp.js';
+import { PROBE, fft, findOnset, makeBandstop, MusicAnalyzer, GapTracker } from '../public/dsp.js';
 import { gapCorrections } from '../public/sync.js';
 
 const SR = 48000;
@@ -129,15 +129,15 @@ test('sans aucun bruit, les restes du filtrage ne passent pas pour un appareil',
     analyzer.addBlock(music.subarray(b * PROBE.block, (b + 1) * PROBE.block), mic.subarray(e - PROBE.maxLag, e + PROBE.block + PROBE.maxLag), (b * PROBE.block) / SR);
   }
   const res = analyzer.results();
-  console.log(`audible : score ${res.get(0).score.toFixed(1)}, niveau ${res.get(0).level.toFixed(1)} dB | absent : score ${res.get(1).score.toFixed(1)}, niveau ${res.get(1).level.toFixed(1)} dB, bord ${res.get(1).edge}`);
-  assert.ok(res.get(0).score > 20 && Math.abs(res.get(0).level) < 3 && Math.abs(res.get(0).lag) < 10);
+  console.log(`audible : score ${res.get(0).score.toFixed(1)}, retard ${res.get(0).lag.toFixed(1)} éch., niveau ${res.get(0).level.toFixed(1)} dB | absent : score ${res.get(1).score.toFixed(1)}, niveau ${res.get(1).level.toFixed(1)} dB, bord ${res.get(1).edge}`);
+  assert.ok(res.get(0).score > 20 && Math.abs(res.get(0).level) < 3 && Math.abs(res.get(0).lag) < 0.0004 * SR);
   assert.ok(res.get(1).level < -40, `niveau ${res.get(1).level}`);
 });
 
 test('un silence dans la musique ne produit pas de mesure', () => {
   const analyzer = new MusicAnalyzer(SR, new Map([[0, PROBE.bands[0]]]));
   analyzer.addBlock(new Float32Array(PROBE.block), new Float32Array(PROBE.block + 2 * PROBE.maxLag), 0);
-  assert.deepEqual(analyzer.results().get(0), { lag: 0, drift: 0, score: 0, blocks: 0, level: -Infinity, edge: false, driftIndex: 0, k0: 0 });
+  assert.deepEqual(analyzer.results().get(0), { lag: 0, drift: 0, score: 0, blocks: 0, level: -Infinity, edge: false, driftIndex: 0, k0: PROBE.maxLag });
 });
 
 // Faux analyseur : un appareil net (« fort ») et un appareil dont le pic dépasse à peine le fond
@@ -157,9 +157,11 @@ function fakeWindow(seed, shift, weakPeak = 2.5) {
   };
   const strongAt = PROBE.maxLag + shift;
   const profiles = { fort: noisy(strongAt, 60), faible: noisy(strongAt + 40, weakPeak) };
+  // Comme le vrai analyseur : le retard de l'appareil net est celui du début de son arrivée.
+  const k0 = Math.round(findOnset(profiles.fort, SR).at);
   return {
     results: () => new Map([
-      ['fort', { lag: shift, drift: 0, score: 80, blocks: 32, level: 0, edge: false, driftIndex: 8, k0: shift }],
+      ['fort', { lag: k0 - PROBE.maxLag, drift: 0, score: 80, blocks: 32, level: 0, edge: false, driftIndex: 8, k0 }],
       ['faible', { lag: 1234, drift: 0, score: 5, blocks: 32, level: -20, edge: false, driftIndex: 3, k0: 1234 }],
     ]),
     profile: (key) => profiles[key],
@@ -167,13 +169,15 @@ function fakeWindow(seed, shift, weakPeak = 2.5) {
 }
 
 test('GapTracker : un appareil faible est reconnu en cumulant plusieurs fenêtres', () => {
-  const tracker = new GapTracker(SR, { scoreMin: 12, levelMin: -30, minBlocks: 16 });
+  const tracker = new GapTracker(SR, { scoreMin: 7, refScoreMin: 8, levelMin: -30, minBlocks: 16 });
   const seen = [];
   [300, -120, 55, 410, -260, 90].forEach((shift, i) => {
     const r = tracker.update(fakeWindow(i + 1, shift));
-    assert.deepEqual([r.get('fort').detected, r.get('fort').lag], [true, shift]);
+    assert.ok(r.get('fort').detected && Math.abs(r.get('fort').lag - shift) < 100, 'appareil net reconnu près de son pic');
     seen.push(r.get('faible'));
-    if (r.get('faible').detected) assert.ok(Math.abs(r.get('faible').lag - (shift + 40)) <= 25, `retard ${r.get('faible').lag}, attendu ${shift + 40}`);
+    // Les deux bosses ont la même forme : leurs débuts sont séparés de 40 échantillons, comme leurs sommets.
+    const gap = r.get('faible').lag - r.get('fort').lag;
+    if (r.get('faible').detected) assert.ok(Math.abs(gap - 40) <= 30, `écart ${gap}, attendu 40`);
   });
   console.log(`appareil faible, fenêtre par fenêtre : ${seen.map((r) => `${r.detected ? 'oui' : 'non'} (${r.score.toFixed(1)})`).join(', ')}`);
   assert.deepEqual(seen.slice(0, 2).map((r) => r.detected), [false, false], 'pas avant trois fenêtres');
@@ -184,6 +188,6 @@ test('GapTracker : un appareil faible est reconnu en cumulant plusieurs fenêtre
 });
 
 test('GapTracker : sans rien dans sa bande, un appareil n’est jamais reconnu', () => {
-  const tracker = new GapTracker(SR, { scoreMin: 12, levelMin: -30, minBlocks: 16 });
+  const tracker = new GapTracker(SR, { scoreMin: 7, refScoreMin: 8, levelMin: -30, minBlocks: 16 });
   for (let i = 0; i < 8; i++) assert.equal(tracker.update(fakeWindow(20 + i, 7 * i, 0)).get('faible').detected, false);
 });

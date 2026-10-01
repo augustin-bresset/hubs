@@ -5,12 +5,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { PROBE, MusicAnalyzer, GapTracker } from '../public/dsp.js';
+import { PROBE, TRACKING, MusicAnalyzer, GapTracker } from '../public/dsp.js';
 
 const dir = process.argv[2] ?? new URL('../captures', import.meta.url).pathname;
-const BLOCKS = 32;
+const BLOCKS = TRACKING.blocks;
 const music = new Map(); // « id@fréquence » -> échantillons mono
-// Mêmes réglages que la page (TRACK_* dans public/app.js).
 let tracker = null;
 
 function loadTrack(id, sampleRate) {
@@ -46,7 +45,7 @@ for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort()
     for (let i = 0; i < PROBE.block; i++) block[i] = ref[(((q + i) % ref.length) + ref.length) % ref.length];
     analyzer.addBlock(block, rec.subarray(x0, x0 + len), offsetS);
   }
-  tracker ??= new GapTracker(sr, { scoreMin: 12, levelMin: -30, minBlocks: BLOCKS / 2 });
+  tracker ??= new GapTracker(sr);
   const res = tracker.update(analyzer);
   const parts = devices.map((c) => {
     const r = res.get(c.id);

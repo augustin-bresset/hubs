@@ -133,7 +133,57 @@ export const PROBE = {
 // Hypothèses de glissement du retard pendant la fenêtre : -400 à +400 ppm par pas de 50.
 const DRIFTS = Array.from({ length: 17 }, (_, i) => (i - 8) * 50e-6);
 
+// Réglages du suivi, partagés par la page et par tools/analyze-capture.mjs. Sur les captures réelles
+// du 1er octobre, une musique sans rapport avec le micro donne des scores de 2 à 4,3 ; une enceinte
+// lointaine, 20 dB sous l'autre appareil, de 6,6 à 16.
+export const TRACKING = {
+  blocks: 32, // blocs de musique par fenêtre de mesure (5,5 s à 48 kHz)
+  scoreMin: 7,
+  refScoreMin: 8,
+  levelMin: -30, // dB par rapport à l'ensemble ; le filtrage des autres appareils laisse -50 dB
+};
+
+// Détection du front montant (voir findOnset).
+const ONSET = { smooth: 0.003, frac: 0.4, sigmas: 4, back: 0.04 };
+
 const sinc = (x) => (x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x));
+
+// Moyenne glissante centrée sur `width` points.
+function boxcar(values, width) {
+  const n = values.length, half = width >> 1;
+  const out = new Float64Array(n);
+  let acc = 0;
+  for (let i = 0; i < n + half; i++) {
+    if (i < n) acc += values[i];
+    if (i >= width) acc -= values[i - width];
+    if (i >= half) out[i - half] = acc / width;
+  }
+  return out;
+}
+
+// Début de l'arrivée du son dans un profil de corrélation. Une enceinte proche donne un pic net ;
+// une enceinte lointaine arrive surtout par la pièce, en une bosse étalée sur des dizaines de ms
+// dont le premier écho dépasse souvent le son direct. On lisse donc le profil sur 3 ms, on juge la
+// bosse par rapport au fond (médiane et dispersion), et on retient le premier instant, dans les
+// 40 ms qui précèdent son sommet, où elle atteint 40 % de sa hauteur.
+// Renvoie { at (indice, fractionnaire), score (hauteur en dispersions du fond), edge }.
+export function findOnset(profile, sampleRate) {
+  const s = boxcar(profile, Math.max(1, Math.round(ONSET.smooth * sampleRate)));
+  const m = PROBE.edge, n = s.length;
+  const sorted = Float64Array.from(s.subarray(m, n - m)).sort();
+  const med = sorted[sorted.length >> 1];
+  const sigma = (sorted[Math.floor(0.84 * sorted.length)] - sorted[Math.floor(0.16 * sorted.length)]) / 2;
+  let max = -Infinity, kmax = m;
+  for (let i = m; i < n - m; i++) if (s[i] > max) { max = s[i]; kmax = i; }
+  if (!(sigma > 0)) return { at: kmax, score: 0, edge: true };
+  const threshold = med + Math.max(ONSET.frac * (max - med), ONSET.sigmas * sigma);
+  let k = kmax;
+  for (let i = Math.max(m + 1, kmax - Math.round(ONSET.back * sampleRate)); i <= kmax; i++) {
+    if (s[i] >= threshold) { k = i; break; }
+  }
+  const frac = s[k - 1] < threshold && s[k] > s[k - 1] ? (threshold - s[k - 1]) / (s[k] - s[k - 1]) : 1;
+  return { at: k - 1 + frac, score: (max - med) / sigma, edge: k <= m + 1 || kmax >= n - m - 2 };
+}
 
 // Réponse impulsionnelle d'un filtre à phase linéaire qui retire les bandes [f1, f2] données et
 // laisse le reste intact. Sans bande, c'est un simple retard : tous les appareils gardent ainsi
@@ -185,6 +235,23 @@ export class MusicAnalyzer {
     Object.assign(this, { rr: new Float64Array(n), ri: new Float64Array(n), xr: new Float64Array(n), xi: new Float64Array(n), cr: new Float64Array(n), ci: new Float64Array(n) });
     this.tMin = Infinity;
     this.tMax = -Infinity;
+    // Pour une arrivée unique et nette, le front tombe un peu avant le vrai retard (le pic a une
+    // largeur) : on mesure ce décalage sur la réponse idéale d'une bande et on le retranche.
+    this.bias = 0;
+    const first = this.bands.values().next().value;
+    if (first) {
+      const { cr, ci } = this;
+      cr.fill(0);
+      ci.fill(0);
+      for (let k = first.k0; k <= first.k1; k++) {
+        const theta = (2 * Math.PI * k * PROBE.maxLag) / n;
+        cr[k] = first.taper[k - first.k0] * Math.cos(theta);
+        ci[k] = first.taper[k - first.k0] * Math.sin(theta);
+      }
+      fft(cr, ci);
+      const ideal = Float64Array.from({ length: this.size }, (_, i) => cr[i] * cr[i] + ci[i] * ci[i] + 1e-9 * (i % 7));
+      this.bias = findOnset(ideal, sampleRate).at - PROBE.maxLag;
+    }
   }
 
   // ref : PROBE.block échantillons de la musique de référence.
@@ -241,49 +308,43 @@ export class MusicAnalyzer {
     this.tMax = Math.max(this.tMax, timeS);
   }
 
-  // Par appareil : retard au milieu de la fenêtre (en échantillons, par rapport à l'instant
-  // attendu), glissement retenu, score (hauteur du pic en écarts-types du bruit de fond), nombre
-  // de blocs utilisés, et niveau : ce que le micro reçoit dans la bande de l'appareil, rapporté à
-  // ce qu'il reçoit là où tout le monde joue (dB). Un niveau très bas signale un appareil muet,
-  // dont la bande ne contient que les restes du filtrage des autres. `edge` : pic en bord de plage.
+  // Par appareil : retard du début de son arrivée, au milieu de la fenêtre (en échantillons, par
+  // rapport à l'instant attendu), glissement retenu, score (hauteur de la bosse en dispersions du
+  // fond), nombre de blocs utilisés, et niveau : ce que le micro reçoit dans la bande de l'appareil,
+  // rapporté à ce qu'il reçoit là où tout le monde joue (dB). Un niveau très bas signale un appareil
+  // muet, dont la bande ne contient que les restes du filtrage des autres. `edge` : arrivée en bord
+  // de plage. driftIndex et k0 (indice du front à l'instant 0 de la fenêtre) servent à recaler sur
+  // cet appareil les profils des autres, voir GapTracker.
   results() {
     const out = new Map();
     const tMid = (this.tMin + this.tMax) / 2;
-    const guard = Math.round(0.006 * this.sampleRate);
+    const width = Math.max(1, Math.round(ONSET.smooth * this.sampleRate));
     for (const [key, band] of this.bands) {
       if (band.blocks === 0) {
-        out.set(key, { lag: 0, drift: 0, score: 0, blocks: 0, level: -Infinity, edge: false, driftIndex: 0, k0: 0 });
+        out.set(key, { lag: 0, drift: 0, score: 0, blocks: 0, level: -Infinity, edge: false, driftIndex: 0, k0: PROBE.maxLag });
         continue;
       }
-      const gain = band.heard / band.played, sharedGain = this.sharedHeard / this.sharedPlayed;
-      const level = 10 * Math.log10(gain / sharedGain);
-      let best = null;
+      // Hypothèse de glissement retenue : celle qui donne la bosse la plus haute.
+      let driftIndex = 0, top = -Infinity;
       for (let h = 0; h < DRIFTS.length; h++) {
-        const profile = band.profiles[h];
-        let max = -Infinity, kmax = 0;
-        for (let i = 0; i < profile.length; i++) if (profile[i] > max) { max = profile[i]; kmax = i; }
-        if (!best || max > best.max) best = { profile, max, kmax, drift: DRIFTS[h], driftIndex: h };
+        const smooth = boxcar(band.profiles[h], width);
+        let max = -Infinity;
+        for (let i = PROBE.edge; i < smooth.length - PROBE.edge; i++) if (smooth[i] > max) max = smooth[i];
+        if (max > top) { top = max; driftIndex = h; }
       }
-      const { profile, max, kmax, drift, driftIndex } = best;
-      let sum = 0, sum2 = 0, count = 0;
-      for (let i = 0; i < profile.length; i++) {
-        if (Math.abs(i - kmax) <= guard) continue;
-        sum += profile[i];
-        sum2 += profile[i] * profile[i];
-        count++;
-      }
-      const mean = sum / count;
-      const std = Math.sqrt(Math.max(sum2 / count - mean * mean, 0));
-      // Sommet de la parabole passant par le maximum et ses deux voisins.
-      let peak = kmax;
-      if (kmax > 0 && kmax < profile.length - 1) {
-        const a = profile[kmax - 1], b = profile[kmax], c = profile[kmax + 1];
-        if (a - 2 * b + c < 0) peak += (0.5 * (a - c)) / (a - 2 * b + c);
-      }
-      const edge = kmax < PROBE.edge || kmax > profile.length - 1 - PROBE.edge;
-      // driftIndex et k0 (position du pic à l'instant 0 de la fenêtre) servent à recaler sur cet
-      // appareil les profils des autres, voir GapTracker.
-      out.set(key, { lag: peak - PROBE.maxLag + drift * tMid * this.sampleRate, drift, score: std > 0 ? (max - mean) / std : 0, blocks: band.blocks, level, edge, driftIndex, k0: kmax - PROBE.maxLag });
+      const onset = findOnset(band.profiles[driftIndex], this.sampleRate);
+      const drift = DRIFTS[driftIndex];
+      const level = 10 * Math.log10(band.heard / band.played / (this.sharedHeard / this.sharedPlayed));
+      out.set(key, {
+        lag: onset.at - PROBE.maxLag - this.bias + drift * tMid * this.sampleRate,
+        drift,
+        score: onset.score,
+        blocks: band.blocks,
+        level,
+        edge: onset.edge,
+        driftIndex,
+        k0: Math.round(onset.at),
+      });
     }
     return out;
   }
@@ -298,15 +359,17 @@ export class MusicAnalyzer {
   }
 }
 
-// Additionne les profils de fenêtres successives, recalés sur l'arrivée d'un appareil de référence.
+// Additionne les profils de fenêtres successives, recalés sur le début de l'arrivée d'un appareil
+// de référence.
 class ProfileStack {
   constructor(depth) {
     this.depth = depth;
     this.items = [];
   }
 
+  // refK0 : indice du front de la référence dans cette fenêtre.
   add(profile, refK0) {
-    this.items.push({ profile, shift: refK0 });
+    this.items.push({ profile, shift: refK0 - PROBE.maxLag });
     if (this.items.length > this.depth) this.items.shift();
   }
 
@@ -317,37 +380,21 @@ class ProfileStack {
     for (const { profile, shift } of this.items) {
       for (let i = Math.max(0, -shift); i < Math.min(n, n - shift); i++) sum[i] += profile[i + shift];
     }
-    let max = -Infinity, kmax = 0;
-    for (let i = 0; i < n; i++) if (sum[i] > max) { max = sum[i]; kmax = i; }
-    // Fond mesuré loin du pic : la réverbération qui le suit sur des dizaines de ms n'en fait pas partie.
-    const before = Math.round(0.006 * sampleRate), after = Math.round(0.06 * sampleRate);
-    let acc = 0, acc2 = 0, count = 0;
-    for (let i = 0; i < n; i++) {
-      if (i >= kmax - before && i <= kmax + after) continue;
-      acc += sum[i];
-      acc2 += sum[i] * sum[i];
-      count++;
-    }
-    const mean = acc / count, std = Math.sqrt(Math.max(acc2 / count - mean * mean, 0));
-    // Le son direct d'une enceinte lointaine est parfois plus faible que ses premiers échos :
-    // on retient le premier pic comparable dans les 20 ms qui précèdent le maximum.
-    let first = kmax;
-    const floor = mean + 0.6 * (max - mean);
-    for (let i = Math.max(1, kmax - Math.round(0.02 * sampleRate)); i < kmax; i++) {
-      if (sum[i] >= floor && sum[i] >= sum[i - 1] && sum[i] >= sum[i + 1]) { first = i; break; }
-    }
-    const edge = first < PROBE.edge || first > n - 1 - PROBE.edge;
-    return { lag: first - PROBE.maxLag, score: std > 0 ? (max - mean) / std : 0, count: this.items.length, edge };
+    const onset = findOnset(sum, sampleRate);
+    return { lag: onset.at - PROBE.maxLag, score: onset.score, edge: onset.edge, count: this.items.length };
   }
 }
 
-// Décide, fenêtre après fenêtre, quels appareils sont reconnus et à quel retard. Un appareil bien
-// audible ressort dans une seule fenêtre. Un appareil faible ou lointain (son surtout réverbéré)
-// ne ressort qu'en cumulant plusieurs fenêtres, recalées sur l'appareil le mieux reconnu : le
-// trajet du micro fait glisser tous les retards ensemble d'une fenêtre à l'autre.
+// Décide, fenêtre après fenêtre, quels appareils sont reconnus et à quel retard. L'appareil le mieux
+// reconnu sert de référence. Pour chacun des autres, on cumule les profils des dernières fenêtres,
+// recalés sur la référence (le trajet du micro fait glisser tous les retards ensemble d'une fenêtre
+// à l'autre) : c'est ce cumul qui donne son écart, bien plus stable que la mesure d'une seule fenêtre
+// quand l'appareil est faible ou lointain.
 export class GapTracker {
-  constructor(sampleRate, { scoreMin, levelMin, minBlocks, depth = 6, minWindows = 3 }) {
-    Object.assign(this, { sampleRate, scoreMin, levelMin, minBlocks, depth, minWindows });
+  // scoreMin : score minimal d'un appareil ; refScoreMin : de la référence ; strongScore : score
+  // au-delà duquel une seule fenêtre suffit ; minWindows : fenêtres à cumuler sinon.
+  constructor(sampleRate, { scoreMin = TRACKING.scoreMin, refScoreMin = TRACKING.refScoreMin, strongScore = 2 * scoreMin, levelMin = TRACKING.levelMin, minBlocks = TRACKING.blocks / 2, depth = 6, minWindows = 3 } = {}) {
+    Object.assign(this, { sampleRate, scoreMin, refScoreMin, strongScore, levelMin, minBlocks, depth, minWindows });
     this.stacks = new Map();
     this.refKey = null;
   }
@@ -363,9 +410,10 @@ export class GapTracker {
   update(analyzer) {
     const res = analyzer.results();
     const usable = (r) => r.blocks >= this.minBlocks && r.level >= this.levelMin;
-    const strong = (r) => usable(r) && r.score >= this.scoreMin && !r.edge;
     let ref = null, refKey = null;
-    for (const [key, r] of res) if (strong(r) && (!ref || r.score > ref.score)) { ref = r; refKey = key; }
+    for (const [key, r] of res) {
+      if (usable(r) && !r.edge && r.score >= this.refScoreMin && (!ref || r.score > ref.score)) { ref = r; refKey = key; }
+    }
     // Les cumuls sont recalés sur l'appareil de référence : s'il change, ils ne valent plus rien.
     if (ref && refKey !== this.refKey) {
       this.stacks.clear();
@@ -375,19 +423,22 @@ export class GapTracker {
     const out = new Map();
     for (const [key, r] of res) {
       const base = { score: r.score, level: r.level, drift: r.drift, windows: 1 };
-      let stacked = null;
-      if (ref && key !== refKey && usable(r)) {
-        if (!this.stacks.has(key)) this.stacks.set(key, new ProfileStack(this.depth));
-        const stack = this.stacks.get(key);
-        stack.add(analyzer.profile(key, ref.driftIndex), ref.k0);
-        stacked = stack.result(this.sampleRate);
+      if (key === refKey) {
+        out.set(key, { ...base, detected: true, lag: r.lag });
+        continue;
       }
-      const cumulated = stacked && stacked.count >= this.minWindows && stacked.score >= this.scoreMin && !stacked.edge;
-      // Quand les deux mesures existent, on garde la plus nette.
-      if (cumulated && !(strong(r) && r.score >= stacked.score)) {
-        out.set(key, { score: stacked.score, level: r.level, drift: ref.drift, windows: stacked.count, detected: true, lag: ref.lag + stacked.lag });
-      } else if (strong(r)) out.set(key, { ...base, detected: true, lag: r.lag });
-      else out.set(key, { ...base, windows: stacked?.count ?? 1, detected: false, lag: null });
+      if (!ref || !usable(r)) {
+        out.set(key, { ...base, detected: false, lag: null });
+        continue;
+      }
+      if (!this.stacks.has(key)) this.stacks.set(key, new ProfileStack(this.depth));
+      const stack = this.stacks.get(key);
+      stack.add(analyzer.profile(key, ref.driftIndex), ref.k0);
+      const s = stack.result(this.sampleRate);
+      const enough = s.count >= this.minWindows || (r.score >= this.strongScore && !r.edge);
+      out.set(key, enough && s.score >= this.scoreMin && !s.edge
+        ? { score: s.score, level: r.level, drift: ref.drift, windows: s.count, detected: true, lag: ref.lag + s.lag }
+        : { ...base, windows: s.count, detected: false, lag: null });
     }
     return out;
   }

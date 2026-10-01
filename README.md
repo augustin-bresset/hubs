@@ -48,11 +48,13 @@ du son (mode « appel », profil Bluetooth mains-libres) et fausser la mesure.
 - **Suivi continu** : la musique sert de signal de mesure. Chaque appareil a une bande de 600 Hz
   (entre 3,4 et 6,9 kHz) où il est le seul à la jouer : pendant le suivi, les autres la retirent de
   leur musique. Le micro corrèle ce qu'il entend avec la musique dans la bande de chaque appareil,
-  par blocs de 171 ms dont on additionne les énergies pendant 5,5 s, et chacun est ramené vers la
-  moyenne du groupe. Rien n'est ajouté au son, et un appareil bien moins fort que les autres reste
-  mesurable puisqu'il est seul dans sa bande ; s'il est trop faible ou trop réverbéré pour ressortir en
-  une fenêtre, les fenêtres successives sont cumulées, recalées sur l'appareil le mieux reconnu.
-  Quatre appareils au plus.
+  par blocs de 171 ms dont on additionne les énergies pendant 5,5 s. Rien n'est ajouté au son, et
+  un appareil bien moins fort que les autres reste mesurable puisqu'il est seul dans sa bande.
+  Une enceinte lointaine arrive surtout par la pièce, en une bosse étalée sur des dizaines de ms :
+  on mesure donc le début de l'arrivée (front montant du profil lissé), pas un pic. L'appareil le
+  mieux reconnu sert de référence ; l'écart des autres vient du cumul de leurs six dernières
+  fenêtres, recalées sur lui. Les corrections sont prudentes : rien sous 2 ms d'écart, 6 ms au plus
+  par pas. Quatre appareils au plus.
 - **Sortie maintenue éveillée** : chaque page joue en permanence un bruit infime (−80 dB), pour que la
   sortie audio ne se mette pas en veille pendant les silences et ne change pas de latence au réveil.
 

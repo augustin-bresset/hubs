@@ -1,4 +1,4 @@
-import { makeChirp, detectChirp, median, PROBE, makeBandstop, MusicAnalyzer, GapTracker } from './dsp.js';
+import { makeChirp, detectChirp, median, PROBE, TRACKING, makeBandstop, MusicAnalyzer, GapTracker } from './dsp.js';
 import { fitClock, localToServer, serverToLocal, gapCorrections } from './sync.js';
 
 const $ = (id) => document.getElementById(id);
@@ -16,9 +16,7 @@ const INTEG_MAX = 5e-4;
 const INTEG_FREEZE_S = 0.003;
 const STABILITY_ROUNDS = 10;
 const MODE_LABEL = { measure: 'calibration', verify: 'vérification', probe: 'mesure', track: 'suivi' };
-const TRACK_BLOCKS = 32; // blocs de musique par mesure de suivi (5,5 s à 48 kHz)
-const TRACK_SCORE_MIN = 12; // en simulation : appareil muet < 5, appareil présent > 40
-const TRACK_LEVEL_MIN_DB = -30; // niveau minimal d'un appareil par rapport à l'ensemble ; le filtre des autres laisse -50 dB
+const TRACK_BLOCKS = TRACKING.blocks;
 const TRACK_SETTLE_MS = 4000; // attente après une correction, le temps que la lecture se recale
 // Décalages essayés quand rien n'est trouvé autour de la dernière position connue.
 const TRACK_SWEEP_MS = [150, -150, 300, -300, 450, -450, 600, -600];
@@ -526,7 +524,7 @@ async function trackingLoop() {
     await ensureRecorder();
     S.chunks = [];
     S.recorder.port.postMessage({ on: true });
-    S.gapTracker = new GapTracker(S.ctx.sampleRate, { scoreMin: TRACK_SCORE_MIN, levelMin: TRACK_LEVEL_MIN_DB, minBlocks: TRACK_BLOCKS / 2 });
+    S.gapTracker = new GapTracker(S.ctx.sampleRate);
     let notBefore = serverNow();
     while (active()) {
       const result = await analyzeTracking(notBefore, active);
@@ -616,8 +614,9 @@ async function analyzeTracking(notBefore, active) {
     mic: S.micLabel,
     windowStartMs: start,
     results,
-    // Une mesure cumulée sur plusieurs fenêtres est moins précise : pas plus prudents.
-    corrections: gapCorrections(found.map((r) => ({ client: r.client, ms: r.ms })), found.some((r) => r.windows > 1) ? { maxStepMs: 5 } : undefined),
+    // On ne touche pas à une calibration correcte : rien en dessous de 2 ms d'écart entre deux
+    // appareils (1 ms de part et d'autre de la moyenne), et des pas de 6 ms au plus.
+    corrections: gapCorrections(found.map((r) => ({ client: r.client, ms: r.ms })), { deadbandMs: 1, maxStepMs: 6 }),
   };
 }
 
@@ -646,9 +645,9 @@ async function correlateWindow(start, centerMs, devices, pb, buf) {
     analyzer.addBlock(ref, data.subarray(x0, x0 + len), offsetS);
     if (b % 8 === 7) await sleep(0); // laisse respirer l'interface
   }
-  // Un appareil est reconnu si son pic est net, loin du bord de la plage, et si sa bande contient
-  // vraiment de la musique (une bande presque vide ne porte que les restes du filtrage des autres).
-  // Faute de pic net dans cette fenêtre, GapTracker la cumule avec les précédentes.
+  // GapTracker décide qui est reconnu : l'appareil le plus net sert de référence, l'écart des autres
+  // vient du cumul de leurs dernières fenêtres. Une bande presque vide (restes du filtrage des
+  // autres appareils) ou une arrivée en bord de plage ne compte pas.
   const out = S.gapTracker.update(analyzer);
   return devices.map((c) => {
     const r = out.get(c.id);
