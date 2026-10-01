@@ -9,8 +9,11 @@ const LOOPBACK_DELAY = 0.123;
 
 const PSR_MIN = 10; // score minimal pour considérer un chirp comme détecté
 const HARD_RESYNC_S = 0.06; // au-delà, on recale d'un coup plutôt que d'ajuster la vitesse
-const DEADBAND_S = 0.0015;
 const MAX_RATE_DEV = 0.01;
+const KP = 0.5; // 1/s : un écart de 1 ms corrige la vitesse de 500 ppm
+const KI = 0.05; // 1/s² : apprend la dérive constante en une vingtaine de secondes
+const INTEG_MAX = 5e-4;
+const INTEG_FREEZE_S = 0.003;
 const STABILITY_ROUNDS = 10;
 const MODE_LABEL = { measure: 'calibration', verify: 'vérification', probe: 'mesure' };
 
@@ -36,7 +39,7 @@ const S = {
   loading: null,
   play: null,
   errMs: null,
-  lastResync: 0,
+  rateBias: 0,
   clients: [],
   recorder: null,
   micStream: null,
@@ -159,40 +162,90 @@ function getBuffer(trackId) {
   return S.loading.promise;
 }
 
-function stopSource() {
-  const p = S.play;
-  if (!p) return;
-  S.play = null;
-  S.errMs = null;
-  const t = S.ctx.currentTime;
-  p.gain.gain.cancelScheduledValues(t);
-  p.gain.gain.setValueAtTime(p.gain.gain.value, t);
-  p.gain.gain.linearRampToValueAtTime(0, t + 0.015);
-  try {
-    p.src.stop(t + 0.02);
-  } catch { /* déjà arrêtée */ }
+// Source bouclée asservie à l'horloge serveur : la position `pos0` (s) du tampon doit être
+// *entendue* à l'heure serveur `t0` (ms). Sert à la musique comme à la signature de suivi.
+class SyncedLoop {
+  constructor(buffer, t0, pos0, level = 1) {
+    Object.assign(this, { buffer, t0, pos0, level, err: null, lastResync: 0 });
+    this.integ = S.rateBias; // dérive déjà apprise par une autre source du même appareil
+    this.start();
+  }
+
+  start() {
+    const ctx = S.ctx;
+    this.src = ctx.createBufferSource();
+    this.src.buffer = this.buffer;
+    this.src.loop = true;
+    this.gain = ctx.createGain();
+    this.src.connect(this.gain).connect(S.master);
+
+    // Lancé en avance de la latence, pour que le son sorte de l'enceinte à l'heure voulue.
+    let when = serverToCtx(this.t0) - S.latencyMs / 1000;
+    let pos = this.pos0;
+    const earliest = ctx.currentTime + 0.08;
+    if (when < earliest) {
+      pos += earliest - when; // on arrive en cours de route
+      when = earliest;
+    }
+    const dur = this.buffer.duration;
+    this.gain.gain.setValueAtTime(0, when);
+    this.gain.gain.linearRampToValueAtTime(this.level, when + 0.02);
+    this.src.start(when, ((pos % dur) + dur) % dur);
+    Object.assign(this, { anchorCtx: when, anchorPos: pos, rate: 1, lastTick: null });
+  }
+
+  stop() {
+    const t = S.ctx.currentTime, g = this.gain.gain;
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(g.value, t);
+    g.linearRampToValueAtTime(0, t + 0.015);
+    try {
+      this.src.stop(t + 0.02);
+    } catch { /* déjà arrêtée */ }
+  }
+
+  setLevel(level) {
+    this.level = level;
+    this.gain.gain.setTargetAtTime(level, S.ctx.currentTime, 0.05);
+  }
+
+  // Compare la position réellement jouée à celle voulue par l'horloge serveur et ajuste la
+  // vitesse : terme proportionnel pour résorber l'écart, terme intégral pour annuler la dérive
+  // constante entre l'horloge audio et celle du serveur. Recalage franc si l'écart est trop grand.
+  tick() {
+    const t = S.ctx.currentTime;
+    if (t < this.anchorCtx) return;
+    const actual = this.anchorPos + (t - this.anchorCtx) * this.rate;
+    const wanted = this.pos0 + (ctxToServer(t + S.latencyMs / 1000) - this.t0) / 1000;
+    const err = actual - wanted;
+    this.err = err;
+
+    if (Math.abs(err) > HARD_RESYNC_S) {
+      if (performance.now() - this.lastResync > 1000) {
+        this.lastResync = performance.now();
+        log(`recalage (écart ${(err * 1000).toFixed(1)} ms)`);
+        this.stop();
+        this.start();
+      }
+      return;
+    }
+    const dt = this.lastTick === null ? 0 : Math.min(2, t - this.lastTick);
+    this.lastTick = t;
+    // Pas d'apprentissage pendant un gros rattrapage, sinon l'intégrale s'emballe.
+    if (Math.abs(err) < INTEG_FREEZE_S) {
+      this.integ = Math.max(-INTEG_MAX, Math.min(INTEG_MAX, this.integ + KI * err * dt));
+      S.rateBias = this.integ;
+    }
+    this.rate = 1 - Math.max(-MAX_RATE_DEV, Math.min(MAX_RATE_DEV, KP * err + this.integ));
+    this.anchorPos = actual;
+    this.anchorCtx = t;
+    this.src.playbackRate.value = this.rate;
+  }
 }
 
-function startSource(buf) {
-  const ctx = S.ctx, pb = S.playback;
-  const src = ctx.createBufferSource();
-  src.buffer = buf;
-  src.loop = true;
-  const gain = ctx.createGain();
-  src.connect(gain).connect(S.master);
-
-  // Le son doit sortir de l'enceinte à l'heure serveur S0 : on le lance en avance de la latence.
-  let when = serverToCtx(pb.S0) - S.latencyMs / 1000;
-  let pos = pb.P0;
-  const earliest = ctx.currentTime + 0.08;
-  if (when < earliest) {
-    pos += earliest - when; // on arrive en cours de route
-    when = earliest;
-  }
-  gain.gain.setValueAtTime(0, when);
-  gain.gain.linearRampToValueAtTime(1, when + 0.02);
-  src.start(when, ((pos % buf.duration) + buf.duration) % buf.duration);
-  S.play = { src, gain, pb, anchorCtx: when, anchorPos: pos, rate: 1 };
+function stopSource() {
+  S.play?.stop();
+  S.play = null;
 }
 
 async function applyPlayback() {
@@ -207,36 +260,14 @@ async function applyPlayback() {
     return;
   }
   if (S.playback !== pb || S.play) return; // l'état a changé pendant le chargement
-  startSource(buf);
+  S.play = new SyncedLoop(buf, pb.S0, pb.P0);
 }
 
-// Compare la position réellement jouée à celle voulue par l'horloge serveur et corrige :
-// petite variation de vitesse pour les écarts faibles, recalage franc sinon.
 function driftTick() {
-  const p = S.play, ctx = S.ctx;
-  if (!p || ctx.state !== 'running') return;
-  const t = ctx.currentTime;
-  if (t < p.anchorCtx) return;
-  const actual = p.anchorPos + (t - p.anchorCtx) * p.rate;
-  const wanted = p.pb.P0 + (ctxToServer(t + S.latencyMs / 1000) - p.pb.S0) / 1000;
-  const err = actual - wanted;
-  S.errMs = err * 1000;
-
-  if (Math.abs(err) > HARD_RESYNC_S) {
-    if (performance.now() - S.lastResync > 1000) {
-      S.lastResync = performance.now();
-      log(`recalage (écart ${S.errMs.toFixed(1)} ms)`);
-      applyPlayback();
-    }
-    return;
-  }
-  const rate = Math.abs(err) > DEADBAND_S ? 1 - Math.max(-MAX_RATE_DEV, Math.min(MAX_RATE_DEV, err / 2)) : 1;
-  if (rate !== p.rate) {
-    p.anchorPos = actual;
-    p.anchorCtx = t;
-    p.rate = rate;
-    p.src.playbackRate.value = rate;
-  }
+  if (S.ctx.state !== 'running') return;
+  S.play?.tick();
+  const err = S.play?.err;
+  S.errMs = err == null ? null : err * 1000;
 }
 
 function setLatency(ms, source) {
