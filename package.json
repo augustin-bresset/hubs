@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test test/dsp.test.mjs test/sync.test.mjs test/music.test.mjs",
-    "smoke": "node test/smoke.mjs"
+    "smoke": "node test/smoke.mjs",
+    "smoke:firefox": "BROWSER=firefox node test/smoke.mjs"
   },
   "devDependencies": {
     "puppeteer-core": "^22.15.0"

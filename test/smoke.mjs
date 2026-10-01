@@ -23,7 +23,24 @@ await new Promise((resolve, reject) => {
   server.stderr.on('data', (d) => reject(new Error(String(d))));
 });
 
-const browser = await puppeteer.launch({
+// BROWSER=firefox rejoue le même scénario sous Firefox, dont le moteur audio diffère de celui de Chrome.
+const FIREFOX = process.env.BROWSER === 'firefox';
+const TRACK_TOLERANCE_MS = FIREFOX ? 2.5 : 1; // sous Firefox la position de lecture flotte d'environ ±1 ms
+const browser = await puppeteer.launch(FIREFOX ? {
+  product: 'firefox',
+  protocol: 'webDriverBiDi',
+  executablePath: process.env.FIREFOX ?? '/usr/bin/firefox',
+  headless: true,
+  // Firefox en snap ne peut pas lire /tmp : profil dans le dépôt.
+  userDataDir: new URL('../.ff-profile', import.meta.url).pathname,
+  extraPrefsFirefox: {
+    'media.volume_scale': '0.0',
+    'media.autoplay.default': 0,
+    'media.autoplay.blocking_policy': 0,
+    'dom.min_background_timeout_value': 4,
+    'dom.timeout.enable_budget_timer_throttling': false,
+  },
+} : {
   executablePath: process.env.CHROME ?? '/usr/bin/google-chrome',
   headless: 'new',
   args: [
@@ -45,15 +62,17 @@ try {
     await page.goto(url);
     return page;
   };
-  const state = (page) => page.evaluate(() => {
+  // Passage par du JSON : le pilotage de Firefox tronque les objets imbriqués.
+  const state = async (page) => JSON.parse(await page.evaluate(() => {
     const { S } = window.unisson;
-    return { id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing, tracks: S.history.filter((h) => h.mode === 'track'), sig: !!S.sig };
-  });
+    return JSON.stringify({ id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing, tracks: S.history.filter((h) => h.mode === 'track'), notch: S.notchKey, wait: S.trackWait });
+  }));
 
   const a = await open(`http://localhost:${HTTP_PORT}/?loopback`);
-  const b = await open(`https://localhost:${HTTPS_PORT}/`); // passe aussi par le chemin HTTPS
+  // Sous Chrome, B passe par le chemin HTTPS (certificat auto-signé accepté par option).
+  const b = await open(FIREFOX ? `http://localhost:${HTTP_PORT}/` : `https://localhost:${HTTPS_PORT}/`);
   await click(a, '#join');
-  await sleep(1500);
+  await sleep(2500);
   await click(a, '#play');
   await sleep(2500);
   await click(b, '#join'); // B arrive en cours de lecture
@@ -112,23 +131,41 @@ try {
   assert.ok(sa.playing && sb.playing);
   assert.ok(Math.abs(sa.errMs) < 3 && Math.abs(sb.errMs) < 3);
 
-  // Suivi continu pendant la lecture : A retrouve sa propre signature sous le métronome,
-  // au retard attendu (compensation déjà appliquée, donc proche de 0), sans rien corriger seul.
+  // Suivi continu par la musique. A envoie un morceau (bruit large bande), le lit, puis écoute :
+  // il doit se retrouver dans sa propre bande au retard attendu (compensation déjà appliquée, donc
+  // proche de 0) et ne pas trouver B, inaudible pour lui, dans la bande que A lui laisse.
+  await a.evaluate(async () => {
+    const sr = 48000, n = sr * 4, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+    let seed = 1;
+    for (let i = 0; i < n; i++) { seed = (seed * 1664525 + 1013904223) >>> 0; v.setInt16(44 + i * 2, (seed / 2 ** 32 - 0.5) * 16000, true); }
+    await fetch('/api/track?name=bruit.wav', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: buf });
+  });
+  await sleep(500);
   await click(a, '#tracking');
+  await sleep(1500);
+  sa = await state(a); sb = await state(b);
+  assert.ok(sa.wait.includes('ne joue pas'), `sans musique, le suivi attend (« ${sa.wait} »)`);
+  assert.equal(sa.notch, '1', "A retire la bande de B");
+  assert.equal(sb.notch, '0', "B retire la bande de A");
+  await click(a, '#play');
   for (let i = 0; i < 80 && (await state(a)).tracks.length < 2; i++) await sleep(500);
   sa = await state(a); sb = await state(b);
-  assert.ok(sa.sig && sb.sig, 'chaque appareil joue sa signature');
+  assert.ok(sa.tracks.length >= 2, 'mesures de suivi reçues');
   const track = sa.tracks[sa.tracks.length - 1];
   const own = track.results.find((r) => r.client === sa.id);
-  console.log('suivi     A:', own.ms?.toFixed(2), 'ms  score', own.psr.toFixed(1), ' glissement', own.driftPpm.toFixed(0), 'ppm   B score', track.results.find((r) => r.client !== sa.id).psr.toFixed(1));
-  assert.ok(own.detected && Math.abs(own.ms) < 1, `signature de A attendue à ~0 ms, mesurée ${own.ms}`);
-  assert.equal(track.results.find((r) => r.client !== sa.id).detected, false, 'signature de B inaudible pour A');
-  assert.deepEqual(track.corrections, [], 'pas de correction avec un seul appareil détecté');
+  const peer = track.results.find((r) => r.client !== sa.id);
+  console.log('suivi     A:', own.ms?.toFixed(2), 'ms  score', own.psr.toFixed(1), ' glissement', own.driftPpm.toFixed(0), 'ppm   B score', peer.psr.toFixed(1));
+  assert.ok(own.detected && Math.abs(own.ms) < TRACK_TOLERANCE_MS, `A attendu à ~0 ms, mesuré ${own.ms}`);
+  assert.equal(peer.detected, false, 'B inaudible pour A : rien dans sa bande');
+  assert.deepEqual(track.corrections, [], 'pas de correction avec un seul appareil reconnu');
   assert.ok(Math.abs(sa.errMs) < 3 && Math.abs(sb.errMs) < 3, 'la lecture reste calée pendant le suivi');
   await click(a, '#tracking');
   await sleep(1500);
   sa = await state(a); sb = await state(b);
-  assert.ok(!sa.sig && !sb.sig, 'signatures arrêtées avec le suivi');
+  assert.ok(sa.notch === '' && sb.notch === '', 'filtres retirés avec le suivi');
 
   const captures = fs.readdirSync(CAPTURE_DIR);
   assert.ok(captures.some((f) => f.endsWith('.f32')) && captures.some((f) => f.endsWith('.json')), 'enregistrement du micro reçu par le serveur');

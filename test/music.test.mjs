@@ -102,12 +102,15 @@ test('chaque appareil est retrouvé dans sa bande, même 15 dB plus faible que l
     const r = res.get(d.slot);
     const ms = (r.lag / SR) * 1000;
     const expected = d.delayMs - d.ppm * 1e-6 * tMid * 1000;
-    console.log(`emplacement ${d.slot} : score ${r.score.toFixed(1)}, ${ms.toFixed(2)} ms (attendu ${expected.toFixed(2)}), glissement ${(r.drift * 1e6).toFixed(0)} ppm`);
+    console.log(`emplacement ${d.slot} : score ${r.score.toFixed(1)}, ${ms.toFixed(2)} ms (attendu ${expected.toFixed(2)}), glissement ${(r.drift * 1e6).toFixed(0)} ppm, niveau ${r.level.toFixed(1)} dB`);
+    // Estimation grossière (une note tenue dans la bande la fausse de quelques dB) : elle ne sert
+    // qu'à écarter une bande presque vide, 50 dB plus bas.
+    assert.ok(!r.edge && Math.abs(r.level - 20 * Math.log10(d.gain)) < 6, `niveau ${r.level}`);
     assert.ok(r.score > 20, `emplacement ${d.slot} : score ${r.score}`);
     assert.ok(Math.abs(ms - expected) < 0.5, `emplacement ${d.slot} : ${ms} ms, attendu ${expected}`);
     measured.push({ client: d.slot, ms });
   }
-  console.log(`emplacement 2 (muet) : score ${res.get(2).score.toFixed(1)}`);
+  console.log(`emplacement 2 (muet) : score ${res.get(2).score.toFixed(1)}, niveau ${res.get(2).level.toFixed(1)} dB`);
   assert.ok(res.get(2).score < 8, `appareil muet : score ${res.get(2).score}`);
 
   // L'écart de 10 ms entre les deux appareils donne deux corrections opposées.
@@ -115,8 +118,24 @@ test('chaque appareil est retrouvé dans sa bande, même 15 dB plus faible que l
   assert.ok(fixes[0].deltaMs > 2.5 && fixes[1].deltaMs < -2.5, JSON.stringify(fixes));
 });
 
+test('sans aucun bruit, les restes du filtrage ne passent pas pour un appareil', () => {
+  const music = makeMusic(3.5), blocks = 12, pad = PROBE.maxLag + 3000;
+  // Un seul appareil audible (emplacement 0), qui se tait dans la bande de l'emplacement 1.
+  const signal = convolve(music, makeBandstop(SR, [PROBE.bands[1]]));
+  const mic = Float32Array.from({ length: pad * 2 + blocks * PROBE.block }, (_, i) => at(signal, i - pad + DELAY));
+  const analyzer = new MusicAnalyzer(SR, new Map([0, 1].map((s) => [s, PROBE.bands[s]])));
+  for (let b = 0; b < blocks; b++) {
+    const e = pad + b * PROBE.block;
+    analyzer.addBlock(music.subarray(b * PROBE.block, (b + 1) * PROBE.block), mic.subarray(e - PROBE.maxLag, e + PROBE.block + PROBE.maxLag), (b * PROBE.block) / SR);
+  }
+  const res = analyzer.results();
+  console.log(`audible : score ${res.get(0).score.toFixed(1)}, niveau ${res.get(0).level.toFixed(1)} dB | absent : score ${res.get(1).score.toFixed(1)}, niveau ${res.get(1).level.toFixed(1)} dB, bord ${res.get(1).edge}`);
+  assert.ok(res.get(0).score > 20 && Math.abs(res.get(0).level) < 3 && Math.abs(res.get(0).lag) < 10);
+  assert.ok(res.get(1).level < -40, `niveau ${res.get(1).level}`);
+});
+
 test('un silence dans la musique ne produit pas de mesure', () => {
   const analyzer = new MusicAnalyzer(SR, new Map([[0, PROBE.bands[0]]]));
   analyzer.addBlock(new Float32Array(PROBE.block), new Float32Array(PROBE.block + 2 * PROBE.maxLag), 0);
-  assert.deepEqual(analyzer.results().get(0), { lag: 0, drift: 0, score: 0, blocks: 0 });
+  assert.deepEqual(analyzer.results().get(0), { lag: 0, drift: 0, score: 0, blocks: 0, level: -Infinity, edge: false });
 });

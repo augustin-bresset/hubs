@@ -1,4 +1,4 @@
-import { makeChirp, detectChirp, median, SIG, makeSignature, signatureTemplates, SignatureAnalyzer } from './dsp.js';
+import { makeChirp, detectChirp, median, PROBE, makeBandstop, MusicAnalyzer } from './dsp.js';
 import { fitClock, localToServer, serverToLocal, gapCorrections } from './sync.js';
 
 const $ = (id) => document.getElementById(id);
@@ -16,8 +16,9 @@ const INTEG_MAX = 5e-4;
 const INTEG_FREEZE_S = 0.003;
 const STABILITY_ROUNDS = 10;
 const MODE_LABEL = { measure: 'calibration', verify: 'vérification', probe: 'mesure', track: 'suivi' };
-const TRACK_PERIODS = 4; // périodes de signature par mesure de suivi (5,5 s)
-const TRACK_SCORE_MIN = 8; // en simulation : signature absente ≤ 5, signature présente ≥ 10 jusqu'à 24 dB sous la musique
+const TRACK_BLOCKS = 32; // blocs de musique par mesure de suivi (5,5 s à 48 kHz)
+const TRACK_SCORE_MIN = 12; // en simulation : appareil muet < 5, appareil présent > 40
+const TRACK_LEVEL_MIN_DB = -30; // niveau minimal d'un appareil par rapport à l'ensemble ; le filtre des autres laisse -50 dB
 const TRACK_SETTLE_MS = 4000; // attente après une correction, le temps que la lecture se recale
 // Décalages essayés quand rien n'est trouvé autour de la dernière position connue.
 const TRACK_SWEEP_MS = [150, -150, 300, -300, 450, -450, 600, -600];
@@ -59,9 +60,13 @@ const S = {
   testing: false,
   testRound: 0,
   tracking: null, // état du suivi continu diffusé par le serveur
-  sig: null, // signature jouée par cet appareil
-  templates: new Map(), // numéro de signature -> spectres de référence
+  musicBus: null, // entrée de la chaîne musique : filtre coupe-bande puis sortie
+  notch: null,
+  notchKey: null, // emplacements dont la bande est actuellement retirée
+  notchDelay: 0, // retard (s) ajouté par le filtre, compensé au lancement de la lecture
+  notchChangedMs: 0, // heure serveur du dernier changement de filtre
   trackRunning: false,
+  trackWait: '', // pourquoi le suivi ne mesure pas en ce moment
   trackCenterMs: 0, // décalage commun (trajet du micro) autour duquel chercher les signatures
   lastTrack: null,
 };
@@ -176,11 +181,11 @@ function getBuffer(trackId) {
 }
 
 // Source bouclée asservie à l'horloge serveur : la position `pos0` (s) du tampon doit être
-// *entendue* à l'heure serveur `t0` (ms). Sert à la musique comme à la signature de suivi.
+// *entendue* à l'heure serveur `t0` (ms).
 class SyncedLoop {
-  constructor(buffer, t0, pos0, level = 1) {
-    Object.assign(this, { buffer, t0, pos0, level, err: null, lastResync: 0 });
-    this.integ = S.rateBias; // dérive déjà apprise par une autre source du même appareil
+  constructor(buffer, t0, pos0) {
+    Object.assign(this, { buffer, t0, pos0, err: null, lastResync: 0 });
+    this.integ = S.rateBias; // dérive déjà apprise lors d'une lecture précédente
     this.start();
   }
 
@@ -190,10 +195,11 @@ class SyncedLoop {
     this.src.buffer = this.buffer;
     this.src.loop = true;
     this.gain = ctx.createGain();
-    this.src.connect(this.gain).connect(S.master);
+    this.src.connect(this.gain).connect(S.musicBus);
 
-    // Lancé en avance de la latence, pour que le son sorte de l'enceinte à l'heure voulue.
-    let when = serverToCtx(this.t0) - S.latencyMs / 1000;
+    // Lancé en avance de la latence et du retard du filtre, pour que le son sorte de l'enceinte
+    // à l'heure voulue.
+    let when = serverToCtx(this.t0) - S.latencyMs / 1000 - S.notchDelay;
     let pos = this.pos0;
     const earliest = ctx.currentTime + 0.08;
     if (when < earliest) {
@@ -202,7 +208,7 @@ class SyncedLoop {
     }
     const dur = this.buffer.duration;
     this.gain.gain.setValueAtTime(0, when);
-    this.gain.gain.linearRampToValueAtTime(this.level, when + 0.02);
+    this.gain.gain.linearRampToValueAtTime(1, when + 0.02);
     this.src.start(when, ((pos % dur) + dur) % dur);
     Object.assign(this, { anchorCtx: when, anchorPos: pos, rate: 1, lastTick: null });
   }
@@ -217,11 +223,6 @@ class SyncedLoop {
     } catch { /* déjà arrêtée */ }
   }
 
-  setLevel(level) {
-    this.level = level;
-    this.gain.gain.setTargetAtTime(level, S.ctx.currentTime, 0.05);
-  }
-
   // Compare la position réellement jouée à celle voulue par l'horloge serveur et ajuste la
   // vitesse : terme proportionnel pour résorber l'écart, terme intégral pour annuler la dérive
   // constante entre l'horloge audio et celle du serveur. Recalage franc si l'écart est trop grand.
@@ -229,7 +230,7 @@ class SyncedLoop {
     const t = S.ctx.currentTime;
     if (t < this.anchorCtx) return;
     const actual = this.anchorPos + (t - this.anchorCtx) * this.rate;
-    const wanted = this.pos0 + (ctxToServer(t + S.latencyMs / 1000) - this.t0) / 1000;
+    const wanted = this.pos0 + (ctxToServer(t + S.latencyMs / 1000 + S.notchDelay) - this.t0) / 1000;
     const err = actual - wanted;
     this.err = err;
 
@@ -279,8 +280,7 @@ async function applyPlayback() {
 function driftTick() {
   if (S.ctx.state !== 'running') return;
   S.play?.tick();
-  S.sig?.tick();
-  const err = (S.play ?? S.sig)?.err;
+  const err = S.play?.err;
   S.errMs = err == null ? null : err * 1000;
 }
 
@@ -481,24 +481,41 @@ function onCalibResult(res) {
   render();
 }
 
-// --- Suivi continu ----------------------------------------------------------
+// --- Suivi continu par la musique -------------------------------------------
 
-// Démarre, règle ou arrête la signature de cet appareil selon l'état diffusé par le serveur.
-function applyTracking() {
-  const tr = S.tracking;
-  const code = S.clients.find((c) => c.id === S.id)?.code;
-  if (!S.ready || !tr?.on || code == null) {
-    S.sig?.stop();
-    S.sig = null;
-    return;
+// Installe le filtre de la musique de cet appareil : il retire les bandes données (celles des
+// autres appareils pendant le suivi, aucune sinon). Le nœud est remplacé à chaque changement,
+// un ConvolverNode n'acceptant qu'une seule réponse impulsionnelle.
+function setNotch(bands) {
+  const ctx = S.ctx;
+  const ir = makeBandstop(ctx.sampleRate, bands);
+  const buffer = ctx.createBuffer(1, ir.length, ctx.sampleRate);
+  buffer.copyToChannel(ir, 0);
+  const node = new ConvolverNode(ctx, { buffer, disableNormalization: true });
+  node.connect(S.master);
+  S.musicBus.connect(node);
+  const old = S.notch;
+  if (old) {
+    S.musicBus.disconnect(old);
+    setTimeout(() => old.disconnect(), 500); // le temps qu'il finisse de jouer ce qu'il a déjà reçu
   }
-  const level = 10 ** (tr.levelDb / 20);
-  if (!S.sig) {
-    const buf = S.ctx.createBuffer(1, SIG.length, SIG.rate);
-    buf.copyToChannel(makeSignature(code), 0);
-    S.sig = new SyncedLoop(buf, 0, 0, level); // phase calée sur l'heure serveur zéro
-  } else if (S.sig.level !== level) S.sig.setLevel(level);
-  if (tr.listener === S.id && !S.trackRunning) trackingLoop();
+  S.notch = node;
+  S.notchChangedMs = serverNow();
+}
+
+// Applique l'état du suivi diffusé par le serveur : pendant le suivi, chaque appareil se tait dans
+// la bande de chacun des autres, pour que chacun soit seul dans la sienne.
+function applyTracking() {
+  if (!S.ready) return;
+  const tr = S.tracking;
+  const mine = S.clients.find((c) => c.id === S.id)?.slot;
+  const others = tr?.on ? S.clients.filter((c) => c.ready && c.id !== S.id && c.slot != null && c.slot !== mine).map((c) => c.slot) : [];
+  const slots = [...new Set(others)].sort();
+  if (slots.join(',') !== S.notchKey) {
+    S.notchKey = slots.join(',');
+    setNotch(slots.map((slot) => PROBE.bands[slot]));
+  }
+  if (tr?.on && tr.listener === S.id && !S.trackRunning) trackingLoop();
 }
 
 async function trackingLoop() {
@@ -508,14 +525,18 @@ async function trackingLoop() {
     await ensureRecorder();
     S.chunks = [];
     S.recorder.port.postMessage({ on: true });
-    const periodMs = (SIG.length / SIG.rate) * 1000;
-    let notBefore = serverNow() + 1500; // le temps que chaque appareil lance sa signature
+    let notBefore = serverNow();
     while (active()) {
-      const start = Math.ceil(notBefore / periodMs) * periodMs;
-      const result = await analyzeTracking(start, active);
+      const result = await analyzeTracking(notBefore, active);
       if (!result) break;
+      S.trackWait = result.waiting ?? '';
+      if (result.waiting) {
+        render();
+        await sleep(500);
+        continue;
+      }
       await cmd('calibResult', { result });
-      uploadCapture(start, result).catch((err) => log('capture non envoyée :', err.message));
+      uploadCapture(result).catch((err) => log('capture non envoyée :', err.message));
       notBefore = serverNow() + (result.corrections.length ? TRACK_SETTLE_MS : 0);
     }
   } catch (err) {
@@ -523,13 +544,14 @@ async function trackingLoop() {
   }
   S.recorder?.port.postMessage({ on: false });
   S.trackRunning = false;
+  S.trackWait = '';
   if (S.tracking?.on && S.tracking.listener === S.id) cmd('tracking', { on: false }).catch(() => {});
 }
 
 // Envoie au serveur ce que le micro vient d'entendre, avec de quoi le recaler sur l'horloge commune :
 // c'est ce qui permet d'analyser hors ligne une situation où le suivi échoue. Réservé à l'appareil
 // qui héberge le serveur, pour ne pas charger le Wi-Fi.
-async function uploadCapture(start, result) {
+async function uploadCapture(result) {
   if (!isLocal) return;
   const sr = S.ctx.sampleRate;
   const { first, data } = assembleRecording();
@@ -537,39 +559,49 @@ async function uploadCapture(start, result) {
     sampleRate: sr,
     firstFrame: first,
     firstServerMs: ctxToServer(first / sr),
-    windowStartMs: start,
+    windowStartMs: result.windowStartMs,
     centerMs: S.trackCenterMs,
     playback: S.playback,
-    tracking: S.tracking,
     results: result.results,
     clients: S.clients,
     listener: S.id,
+    bands: PROBE.bands,
     mic: S.micStream?.getAudioTracks()[0]?.getSettings() ?? null,
     userAgent: navigator.userAgent,
   };
   await fetch('/api/capture', { method: 'POST', headers: { 'X-Meta': encodeURIComponent(JSON.stringify(meta)) }, body: data });
 }
 
-// Mesure le retard de chaque signature sur la fenêtre qui commence à l'heure serveur `start`.
-async function analyzeTracking(start, active) {
-  const devices = S.clients.filter((c) => c.ready && c.code != null);
-  for (const c of devices) if (!S.templates.has(c.code)) S.templates.set(c.code, signatureTemplates(makeSignature(c.code)));
+// Mesure le retard de chaque appareil sur une fenêtre de musique qui commence au plus tôt à
+// l'heure serveur `notBefore`. Renvoie null si le suivi s'arrête, { waiting } s'il n'y a rien à mesurer.
+async function analyzeTracking(notBefore, active) {
+  const sr = S.ctx.sampleRate;
+  const pb = S.playback;
+  const buf = pb?.playing ? S.buffers.get(pb.track) : null;
+  if (!buf || buf.sampleRate !== sr) return { waiting: 'la musique ne joue pas' };
+  const devices = S.clients.filter((c) => c.ready && c.slot != null);
+  const readyKey = devices.map((c) => `${c.id}:${c.slot}`).join(',');
+  const spanMs = ((TRACK_BLOCKS * PROBE.block) / sr) * 1000;
+  // La fenêtre ne doit contenir ni le début de la lecture ni un changement de filtre.
+  const start = Math.max(notBefore, pb.S0 + 500, S.notchChangedMs + 1500);
 
   // Le trajet du micro décale toutes les arrivées d'un même montant, qui dérive et saute parfois de
   // plusieurs dizaines de ms : on cherche autour de la dernière valeur connue, puis plus large.
   let results = null;
   for (const centerMs of [S.trackCenterMs, ...TRACK_SWEEP_MS.map((d) => S.trackCenterMs + d)]) {
-    const endMs = start + TRACK_PERIODS * (SIG.length / SIG.rate) * 1000 + centerMs + 500;
-    while (active() && serverNow() < endMs) await sleep(100);
+    const endMs = start + spanMs + centerMs + 500;
+    while (active() && S.playback === pb && serverNow() < endMs) await sleep(100);
     if (!active()) return null;
-    const pass = await correlateWindow(start, centerMs, devices);
+    const stillSame = S.clients.filter((c) => c.ready && c.slot != null).map((c) => `${c.id}:${c.slot}`).join(',') === readyKey;
+    if (S.playback !== pb || !stillSame || S.notchChangedMs + 1500 > start) return { waiting: 'la lecture ou les appareils viennent de changer' };
+    const pass = await correlateWindow(start, centerMs, devices, pb, buf);
     if (pass?.some((r) => r.detected)) {
       results = pass;
       break;
     }
     results ??= pass;
   }
-  results ??= devices.map((c) => ({ client: c.id, name: c.name, detected: false, ms: null, psr: 0, driftPpm: 0 }));
+  results ??= devices.map((c) => ({ client: c.id, name: c.name, detected: false, ms: null, psr: 0, driftPpm: 0, levelDb: null }));
 
   const found = results.filter((r) => r.detected);
   if (found.length) S.trackCenterMs = found.reduce((sum, r) => sum + r.ms, 0) / found.length;
@@ -578,40 +610,44 @@ async function analyzeTracking(start, active) {
     mode: 'track',
     listener: S.id,
     mic: S.micLabel,
+    windowStartMs: start,
     results,
     corrections: gapCorrections(found.map((r) => ({ client: r.client, ms: r.ms }))),
   };
 }
 
-async function correlateWindow(start, centerMs, devices) {
+// Corrèle, bloc par bloc, la musique de référence avec ce que le micro a enregistré au moment où
+// chaque bloc devait être entendu (décalé de centerMs), dans la bande propre à chaque appareil.
+async function correlateWindow(start, centerMs, devices, pb, buf) {
   const sr = S.ctx.sampleRate;
   const { first, data } = assembleRecording();
-  const analyzer = new SignatureAnalyzer(new Map(devices.map((c) => [c.id, S.templates.get(c.code)])));
-  const len = SIG.block + 2 * SIG.maxLag, step = sr / SIG.rate;
-  const slice = new Float32Array(len);
-  const blocks = SIG.length / SIG.block;
-  let used = 0;
-  for (let m = 0; m < TRACK_PERIODS; m++) {
-    for (let j = 0; j < blocks; j++) {
-      const offsetS = (m * SIG.length + j * SIG.block) / SIG.rate;
-      // Début de la tranche dans l'enregistrement, ramenée à la fréquence de la signature.
-      const x0 = (serverToCtx(start + offsetS * 1000) + centerMs / 1000 - SIG.maxLag / SIG.rate) * sr - first;
-      if (x0 < 0 || x0 + len * step + 1 >= data.length) continue;
-      for (let i = 0; i < len; i++) {
-        const x = x0 + i * step, k = Math.floor(x);
-        slice[i] = data[k] + (x - k) * (data[k + 1] - data[k]);
-      }
-      analyzer.addBlock(j, slice, offsetS);
-      used++;
+  const analyzer = new MusicAnalyzer(sr, new Map(devices.map((c) => [c.id, PROBE.bands[c.slot]])));
+  const channels = Array.from({ length: buf.numberOfChannels }, (_, c) => buf.getChannelData(c));
+  const ref = new Float32Array(PROBE.block);
+  const len = PROBE.block + 2 * PROBE.maxLag;
+  for (let b = 0; b < TRACK_BLOCKS; b++) {
+    const offsetS = (b * PROBE.block) / sr;
+    // Échantillon de musique entendu à cet instant, puis l'instant exact où lui est entendu.
+    const q = Math.round((pb.P0 + (start + offsetS * 1000 - pb.S0) / 1000) * sr);
+    const heardMs = pb.S0 + (q / sr - pb.P0) * 1000;
+    const x0 = Math.round((serverToCtx(heardMs) + centerMs / 1000) * sr) - PROBE.maxLag - first;
+    if (x0 < 0 || x0 + len > data.length) continue;
+    for (let i = 0; i < PROBE.block; i++) {
+      const k = (((q + i) % buf.length) + buf.length) % buf.length;
+      let v = 0;
+      for (const ch of channels) v += ch[k];
+      ref[i] = v / channels.length;
     }
-    await sleep(0); // laisse respirer l'interface entre deux périodes
+    analyzer.addBlock(ref, data.subarray(x0, x0 + len), offsetS);
+    if (b % 8 === 7) await sleep(0); // laisse respirer l'interface
   }
-  if (used < (TRACK_PERIODS * blocks) / 2) return null;
   const out = analyzer.results();
   return devices.map((c) => {
     const r = out.get(c.id);
-    const detected = r.score >= TRACK_SCORE_MIN;
-    return { client: c.id, name: c.name, detected, ms: detected ? centerMs + (r.lag / SIG.rate) * 1000 : null, psr: r.score, driftPpm: r.drift * 1e6 };
+    // Reconnu si le pic est net, loin du bord de la plage, et si sa bande contient vraiment de la
+    // musique : une bande presque vide ne porte que les restes du filtrage des autres appareils.
+    const detected = r.blocks >= TRACK_BLOCKS / 2 && r.score >= TRACK_SCORE_MIN && !r.edge && r.level >= TRACK_LEVEL_MIN_DB;
+    return { client: c.id, name: c.name, detected, ms: detected ? centerMs + (r.lag / sr) * 1000 : null, psr: r.score, driftPpm: r.drift * 1e6, levelDb: r.level };
   });
 }
 
@@ -779,17 +815,16 @@ function renderTracking() {
   const listener = S.clients.find((c) => c.id === tr.listener)?.name;
   $('tracking').textContent = !tr.on ? 'Activer le suivi (cet appareil écoute)' : tr.listener === S.id ? 'Arrêter le suivi' : `Arrêter le suivi (écoute : ${listener ?? '?'})`;
   $('tracking').disabled = S.calibBusy;
-  if (document.activeElement !== $('sigLevel')) $('sigLevel').value = tr.levelDb;
-  $('sigLevelValue').textContent = `${$('sigLevel').value} dB`;
   const last = S.lastTrack;
   let info = '';
-  if (tr.on && !last) info = 'Première mesure dans quelques secondes…';
+  if (tr.on && S.trackWait) info = `En attente : ${S.trackWait}.`;
+  else if (tr.on && !last) info = 'Première mesure dans quelques secondes…';
   else if (tr.on) {
     const found = last.results.filter((r) => r.detected).length;
     info = found === 0
-      ? 'Aucune signature détectée : monte le niveau de la signature ou rapproche les enceintes du micro.'
+      ? 'Aucun appareil reconnu dans la musique : monte le volume ou rapproche les enceintes du micro.'
       : found === 1
-        ? `Un seul appareil détecté (${relativeValues(last)}) : il en faut deux pour mesurer un écart.`
+        ? `Un seul appareil reconnu (${relativeValues(last)}) : il en faut deux pour mesurer un écart.`
         : `Dernière mesure à ${new Date(last.at).toLocaleTimeString()} : ${relativeValues(last)}. ${last.corrections.length ? `Corrections : ${last.corrections.map((c) => `${nameOf(last, c.client)} ${signed(c.deltaMs)} ms`).join(', ')}.` : 'Aucune correction nécessaire.'}`;
   }
   $('trackInfo').textContent = info;
@@ -852,6 +887,7 @@ function render() {
 
 async function join() {
   $('join').disabled = true;
+  $('join').textContent = 'Activation du son…';
   S.name = $('name').value.trim() || S.name;
   localStorage.setItem('unisson.name', S.name);
 
@@ -863,6 +899,8 @@ async function join() {
   S.chirpBus = ctx.createGain();
   S.chirpBus.gain.value = 0.8;
   S.chirpBus.connect(S.master);
+  S.musicBus = ctx.createGain();
+  S.notchDelay = (PROBE.taps - 1) / 2 / ctx.sampleRate;
   const chirp = makeChirp(ctx.sampleRate);
   S.chirpBuf = ctx.createBuffer(1, chirp.length, ctx.sampleRate);
   S.chirpBuf.copyToChannel(chirp, 0);
@@ -879,31 +917,35 @@ async function join() {
   keepAlive.connect(ctx.destination);
   keepAlive.start();
 
+  // Au démarrage, l'horloge audio avance par à-coups : les premières mesures du lien entre cette
+  // horloge et celle de l'ordinateur sont fausses d'une dizaine de ms. On les jette et on attend
+  // des mesures propres avant de jouer quoi que ce soit, sinon la lecture se décale d'autant
+  // quelques secondes plus tard.
   ctxDeltaLoop();
+  await sleep(1200);
+  S.deltas = [];
+  await sleep(400);
   setInterval(driftTick, 500);
   setInterval(reportStatus, 2000);
 
   const saved = JSON.parse(sessionStorage.getItem('unisson.latency') || 'null');
+  // Sans calibration, on part de l'estimation du navigateur (souvent fausse en Bluetooth).
   if (saved) setLatency(saved.ms, saved.source);
-  else {
-    // Sans calibration, on part de l'estimation du navigateur (souvent fausse en Bluetooth).
-    setTimeout(() => {
-      if (S.latencySource === 'aucune') setLatency((ctx.outputLatency || 0) * 1000, 'navigateur');
-    }, 800);
-  }
+  else setLatency((ctx.outputLatency || 0) * 1000, 'navigateur');
 
   navigator.wakeLock?.request('screen').catch(() => {});
   S.ready = true;
   log(`son activé (${ctx.sampleRate} Hz)`);
   reportStatus();
+  applyTracking(); // installe la chaîne musique avant toute lecture
   applyPlayback();
-  applyTracking();
   render();
 }
 
 $('name').value = S.name;
 $('join').onclick = () => join().catch((err) => {
   $('join').disabled = false;
+  $('join').textContent = 'Rejoindre';
   alert(`Impossible d'activer le son : ${err.message}`);
 });
 $('play').onclick = () => cmd('play');
@@ -925,8 +967,6 @@ $('tracking').onclick = async () => {
   S.lastTrack = null;
   return cmd('tracking', { on: true });
 };
-$('sigLevel').oninput = () => { $('sigLevelValue').textContent = `${$('sigLevel').value} dB`; };
-$('sigLevel').onchange = () => cmd('tracking', { levelDb: Number($('sigLevel').value) });
 $('releaseMic').onclick = releaseMic;
 $('file').onchange = async (e) => {
   const f = e.target.files[0];

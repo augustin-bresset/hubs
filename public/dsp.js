@@ -124,6 +124,9 @@ export const PROBE = {
   maxLag: 4096, // retard recherché : ±85 ms à 48 kHz autour de l'instant attendu
   // Une bande (Hz) par emplacement d'appareil.
   bands: [[3400, 4000], [4300, 4900], [5300, 5900], [6300, 6900]],
+  // Entre ces bandes, tout le monde joue : sert de référence de niveau.
+  shared: [[4050, 4250], [4950, 5250], [5950, 6250]],
+  edge: 256, // retards trop près du bord de la plage de recherche : non fiables
   margin: 70, // Hz écartés de chaque bord pour la mesure : zone de transition du filtre
   taps: 4097, // longueur du filtre coupe-bande ; il retarde le son de (taps - 1) / 2 échantillons
 };
@@ -165,8 +168,19 @@ export class MusicAnalyzer {
       const k1 = Math.floor(((f2 - PROBE.margin) * PROBE.fftSize) / sampleRate);
       // Fenêtre de Hann sur la bande : évite les rebonds de la corrélation de part et d'autre du pic.
       const taper = Float32Array.from({ length: k1 - k0 + 1 }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * (i + 1)) / (k1 - k0 + 2)));
-      this.bands.set(key, { k0, k1, taper, blocks: 0, profiles: DRIFTS.map(() => new Float64Array(this.size)) });
+      this.bands.set(key, { k0, k1, taper, blocks: 0, heard: 0, played: 0, profiles: DRIFTS.map(() => new Float64Array(this.size)) });
     }
+    this.shared = PROBE.shared.map(([f1, f2]) => [Math.ceil((f1 * PROBE.fftSize) / sampleRate), Math.floor((f2 * PROBE.fftSize) / sampleRate)]);
+    this.sharedHeard = 0;
+    this.sharedPlayed = 0;
+    // Fenêtres appliquées avant la FFT : sans elles, la coupure nette du bloc étale un peu de la
+    // musique voisine dans une bande vide et y fait apparaître de faux pics en bord de plage.
+    this.refWindow = Float32Array.from({ length: PROBE.block }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * (i + 0.5)) / PROBE.block));
+    const ramp = 512, len = PROBE.block + 2 * PROBE.maxLag;
+    this.sliceWindow = Float32Array.from({ length: len }, (_, i) => {
+      const d = Math.min(i, len - 1 - i);
+      return d >= ramp ? 1 : 0.5 - 0.5 * Math.cos((Math.PI * (d + 0.5)) / ramp);
+    });
     const n = PROBE.fftSize;
     Object.assign(this, { rr: new Float64Array(n), ri: new Float64Array(n), xr: new Float64Array(n), xi: new Float64Array(n), cr: new Float64Array(n), ci: new Float64Array(n) });
     this.tMin = Infinity;
@@ -180,18 +194,27 @@ export class MusicAnalyzer {
   addBlock(ref, slice, timeS) {
     const { rr, ri, xr, xi, cr, ci, size } = this;
     rr.fill(0); ri.fill(0); xr.fill(0); xi.fill(0);
-    rr.set(ref);
-    xr.set(slice);
+    for (let i = 0; i < ref.length; i++) rr[i] = ref[i] * this.refWindow[i];
+    for (let i = 0; i < slice.length; i++) xr[i] = slice[i] * this.sliceWindow[i];
     fft(rr, ri);
     fft(xr, xi);
+    for (const [k0, k1] of this.shared) {
+      for (let k = k0; k <= k1; k++) {
+        this.sharedPlayed += rr[k] * rr[k] + ri[k] * ri[k];
+        this.sharedHeard += xr[k] * xr[k] + xi[k] * xi[k];
+      }
+    }
     for (const band of this.bands.values()) {
       const { k0, k1, taper } = band;
-      let energy = 0, mean = 0;
+      let energy = 0, heard = 0, mean = 0;
       for (let k = k0; k <= k1; k++) {
         energy += rr[k] * rr[k] + ri[k] * ri[k];
+        heard += xr[k] * xr[k] + xi[k] * xi[k];
         mean += Math.hypot(rr[k], ri[k]) * Math.hypot(xr[k], xi[k]);
       }
       if (energy < 1e-12) continue; // silence dans cette bande : rien à mesurer
+      band.played += energy;
+      band.heard += heard;
       const eps = (1e-3 * mean) / (k1 - k0 + 1) + 1e-20;
       cr.fill(0);
       ci.fill(0);
@@ -219,17 +242,21 @@ export class MusicAnalyzer {
   }
 
   // Par appareil : retard au milieu de la fenêtre (en échantillons, par rapport à l'instant
-  // attendu), glissement retenu, score (hauteur du pic en écarts-types du bruit de fond) et
-  // nombre de blocs utilisés.
+  // attendu), glissement retenu, score (hauteur du pic en écarts-types du bruit de fond), nombre
+  // de blocs utilisés, et niveau : ce que le micro reçoit dans la bande de l'appareil, rapporté à
+  // ce qu'il reçoit là où tout le monde joue (dB). Un niveau très bas signale un appareil muet,
+  // dont la bande ne contient que les restes du filtrage des autres. `edge` : pic en bord de plage.
   results() {
     const out = new Map();
     const tMid = (this.tMin + this.tMax) / 2;
     const guard = Math.round(0.006 * this.sampleRate);
     for (const [key, band] of this.bands) {
       if (band.blocks === 0) {
-        out.set(key, { lag: 0, drift: 0, score: 0, blocks: 0 });
+        out.set(key, { lag: 0, drift: 0, score: 0, blocks: 0, level: -Infinity, edge: false });
         continue;
       }
+      const gain = band.heard / band.played, sharedGain = this.sharedHeard / this.sharedPlayed;
+      const level = 10 * Math.log10(gain / sharedGain);
       let best = null;
       for (let h = 0; h < DRIFTS.length; h++) {
         const profile = band.profiles[h];
@@ -253,7 +280,8 @@ export class MusicAnalyzer {
         const a = profile[kmax - 1], b = profile[kmax], c = profile[kmax + 1];
         if (a - 2 * b + c < 0) peak += (0.5 * (a - c)) / (a - 2 * b + c);
       }
-      out.set(key, { lag: peak - PROBE.maxLag + drift * tMid * this.sampleRate, drift, score: std > 0 ? (max - mean) / std : 0, blocks: band.blocks });
+      const edge = kmax < PROBE.edge || kmax > profile.length - 1 - PROBE.edge;
+      out.set(key, { lag: peak - PROBE.maxLag + drift * tMid * this.sampleRate, drift, score: std > 0 ? (max - mean) / std : 0, blocks: band.blocks, level, edge });
     }
     return out;
   }

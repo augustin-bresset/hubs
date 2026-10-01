@@ -40,9 +40,9 @@ const BOOT = randomUUID(); // l'horloge repart de zéro à chaque démarrage : l
 
 const clients = new Map(); // id -> { id, name, ready, status, res }
 const history = []; // résultats de calibration, du plus ancien au plus récent
-const codes = new Map(); // id d'appareil -> numéro de signature, stable d'une reconnexion à l'autre
-// Suivi continu : chaque appareil joue sa signature, celui qui écoute mesure les écarts en permanence.
-let tracking = { on: false, listener: null, levelDb: -36 };
+const SLOTS = 4; // emplacements de suivi : un par bande de fréquences réservée (voir PROBE.bands)
+// Suivi continu : chaque appareil a sa bande réservée dans la musique, celui qui écoute y mesure son retard.
+let tracking = { on: false, listener: null };
 let track = null; // dernier fichier envoyé : { id, name, type, data }
 // Position P0 (s) de la piste à l'instant serveur S0 (ms).
 let playback = { track: 'metronome', playing: false, S0: 0, P0: 0 };
@@ -53,7 +53,7 @@ function send(res, event, data) {
 function broadcast(event, data) {
   for (const c of clients.values()) send(c.res, event, data);
 }
-const clientList = () => [...clients.values()].map(({ id, name, ready, status, code }) => ({ id, name, ready, status, code }));
+const clientList = () => [...clients.values()].map(({ id, name, ready, status, slot }) => ({ id, name, ready, status, slot }));
 const trackInfo = () => track && { id: track.id, name: track.name };
 
 let clientsTimer = null;
@@ -105,7 +105,7 @@ function recordCalib(result) {
   const parts = entry.results.map((r) => {
     const value = r.detected ? `${fmt(r.ms)}ms` : 'non détecté';
     const detail = entry.mode === 'track'
-      ? `score ${fmt(r.psr)}, glissement ${Math.round(r.driftPpm ?? 0)} ppm`
+      ? `score ${fmt(r.psr)}, niveau ${r.levelDb == null ? '–' : `${Math.round(r.levelDb)} dB`}, glissement ${Math.round(r.driftPpm ?? 0)} ppm`
       : `dispersion ${fmt(r.spreadMs)}, ${r.hits}/${r.reps}, score ${Math.round(Math.min(r.psr, 999))}`;
     return `${r.name}=${value} (${detail}, comp ${fmt(r.compMs)})`;
   });
@@ -117,14 +117,13 @@ function recordCalib(result) {
 }
 
 function setTracking(msg) {
-  if (typeof msg.levelDb === 'number') tracking.levelDb = Math.max(-70, Math.min(-20, msg.levelDb));
   if (msg.on === true) {
     if (!clients.get(msg.id)?.ready) return { ok: false, error: "l'appareil qui écoute n'a pas rejoint" };
-    tracking = { ...tracking, on: true, listener: msg.id };
-  } else if (msg.on === false) {
-    tracking = { ...tracking, on: false, listener: null };
+    tracking = { on: true, listener: msg.id };
+  } else {
+    tracking = { on: false, listener: null };
   }
-  console.log(`[${new Date().toLocaleTimeString('fr-FR')}] suivi ${tracking.on ? 'actif' : 'arrêté'}, signature à ${tracking.levelDb} dB`);
+  console.log(`[${new Date().toLocaleTimeString('fr-FR')}] suivi ${tracking.on ? 'actif' : 'arrêté'}`);
   broadcast('tracking', tracking);
   return { ok: true };
 }
@@ -219,8 +218,10 @@ async function handle(req, res) {
     const old = clients.get(id);
     old?.res.end();
     const name = (url.searchParams.get('name') || 'Appareil').slice(0, 40);
-    if (!codes.has(id)) codes.set(id, codes.size);
-    const client = { ready: false, status: null, ...old, id, name, res, code: codes.get(id) };
+    // Premier emplacement libre ; au-delà de SLOTS appareils, les suivants ne sont pas suivis.
+    const taken = new Set([...clients.values()].filter((c) => c.id !== id).map((c) => c.slot));
+    const free = Array.from({ length: SLOTS }, (_, i) => i).find((i) => !taken.has(i)) ?? null;
+    const client = { ready: false, status: null, slot: free, ...old, id, name, res };
     clients.set(id, client);
     send(res, 'hello', { clients: clientList(), track: trackInfo(), playback, history, tracking });
     broadcastClients();
@@ -259,6 +260,9 @@ async function handle(req, res) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     fs.writeFileSync(path.join(CAPTURE_DIR, `${stamp}.f32`), data);
     fs.writeFileSync(path.join(CAPTURE_DIR, `${stamp}.json`), JSON.stringify({ ...meta, track: trackInfo() }, null, 1));
+    // Le morceau joué, pour pouvoir refaire l'analyse hors ligne.
+    const trackFile = track && path.join(CAPTURE_DIR, `track-${track.id}`);
+    if (trackFile && meta.playback?.track === track.id && !fs.existsSync(trackFile)) fs.writeFileSync(trackFile, track.data);
     const old = fs.readdirSync(CAPTURE_DIR).filter((f) => f.endsWith('.f32')).sort().slice(0, -CAPTURE_KEEP);
     for (const f of old) {
       fs.rmSync(path.join(CAPTURE_DIR, f));
