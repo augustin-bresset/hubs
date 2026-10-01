@@ -1,5 +1,6 @@
 import { makeChirp, detectChirp, median, PROBE, TRACKING, makeBandstop, MusicAnalyzer, GapTracker } from './dsp.js';
 import { fitClock, localToServer, serverToLocal, gapCorrections } from './sync.js';
+import { BRAND } from './brand.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -29,8 +30,8 @@ const ROOM = (location.pathname.split('/')[2] ?? '').toUpperCase();
 const API = `/api/rooms/${ROOM}`;
 
 const S = {
-  id: sessionStorage.getItem('unisson.id') || Math.random().toString(36).slice(2, 10),
-  name: localStorage.getItem('unisson.name') || `${isMobile ? 'Téléphone' : 'Ordi'} ${Math.floor(Math.random() * 90 + 10)}`,
+  id: sessionStorage.getItem('sync.id') || Math.random().toString(36).slice(2, 10),
+  name: localStorage.getItem('sync.name') || `${isMobile ? 'Téléphone' : 'Ordi'} ${Math.floor(Math.random() * 90 + 10)}`,
   ready: false,
   connected: false,
   ctx: null,
@@ -72,12 +73,12 @@ const S = {
   trackCenterMs: 0, // décalage commun (trajet du micro) autour duquel chercher les signatures
   lastTrack: null,
 };
-sessionStorage.setItem('unisson.id', S.id);
+sessionStorage.setItem('sync.id', S.id);
 
 function log(...parts) {
   const line = `${new Date().toLocaleTimeString()}  ${parts.join(' ')}`;
   $('log').textContent = `${line}\n${$('log').textContent}`.slice(0, 8000);
-  console.log('[unisson]', ...parts);
+  console.log('[sync]', ...parts);
 }
 
 async function cmd(type, extra = {}) {
@@ -289,7 +290,7 @@ function driftTick() {
 function setLatency(ms, source) {
   S.latencyMs = Math.max(-200, Math.min(2000, Math.round(ms * 10) / 10));
   S.latencySource = source;
-  sessionStorage.setItem('unisson.latency', JSON.stringify({ ms: S.latencyMs, source }));
+  sessionStorage.setItem('sync.latency', JSON.stringify({ ms: S.latencyMs, source }));
   reportStatus();
   render();
 }
@@ -899,7 +900,7 @@ async function join() {
   $('join').disabled = true;
   $('join').textContent = 'Activation du son…';
   S.name = $('name').value.trim() || S.name;
-  localStorage.setItem('unisson.name', S.name);
+  localStorage.setItem('sync.name', S.name);
 
   const ctx = new AudioContext({ latencyHint: 'interactive' });
   await ctx.resume();
@@ -938,7 +939,7 @@ async function join() {
   setInterval(driftTick, 500);
   setInterval(reportStatus, 2000);
 
-  const saved = JSON.parse(sessionStorage.getItem('unisson.latency') || 'null');
+  const saved = JSON.parse(sessionStorage.getItem('sync.latency') || 'null');
   // Sans calibration, on part de l'estimation du navigateur (souvent fausse en Bluetooth).
   if (saved) setLatency(saved.ms, saved.source);
   else setLatency((ctx.outputLatency || 0) * 1000, 'navigateur');
@@ -992,6 +993,8 @@ $('file').onchange = async (e) => {
 };
 
 async function start() {
+  for (const el of document.querySelectorAll('[data-brand]')) el.textContent = BRAND;
+  document.title = BRAND;
   const meta = await fetch(API).then((r) => (r.ok ? r.json() : null)).catch(() => null);
   if (!meta) {
     $('joinCard').hidden = true;
@@ -1000,7 +1003,7 @@ async function start() {
     return;
   }
   $('roomName').textContent = meta.name;
-  document.title = `${meta.name} — Unisson`;
+  document.title = `${meta.name} — ${BRAND}`;
   $('fileLabel').hidden = !meta.isOwner; // le morceau est stocké sur le serveur : seul le créateur en envoie
 
   // Lien à ouvrir sur les autres appareils. Depuis localhost, c'est l'adresse du réseau local qu'il faut donner.
@@ -1018,4 +1021,4 @@ async function start() {
 start();
 
 // Pour les tests et le débogage depuis la console.
-window.unisson = { S, serverNow };
+window.sync = { S, serverNow };

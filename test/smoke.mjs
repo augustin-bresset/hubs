@@ -70,7 +70,7 @@ try {
   const state = async (page) => {
     const errs = [];
     for (let i = 0; i < 5; i++) {
-      errs.push(await page.evaluate(() => window.unisson.S.errMs));
+      errs.push(await page.evaluate(() => window.sync.S.errMs));
       await sleep(300);
     }
     const snapshot = await snapshotOf(page);
@@ -79,7 +79,7 @@ try {
   };
   // Passage par du JSON : le pilotage de Firefox tronque les objets imbriqués.
   const snapshotOf = async (page) => JSON.parse(await page.evaluate(() => {
-    const { S } = window.unisson;
+    const { S } = window.sync;
     return JSON.stringify({ id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing, tracks: S.history.filter((h) => h.mode === 'track'), notch: S.notchKey, wait: S.trackWait });
   }));
 

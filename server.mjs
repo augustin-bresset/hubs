@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Serveur Unisson : fichiers statiques, horloge de référence, comptes, salles et relais
+// Serveur : fichiers statiques, horloge de référence, comptes, salles et relais
 // d'événements (SSE). Aucune dépendance : `node server.mjs`.
 import http from 'node:http';
 import https from 'node:https';
@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createAuth, isLoopback } from './server/auth.mjs';
 import { createRooms } from './server/rooms.mjs';
+import { BRAND } from './public/brand.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -200,7 +201,7 @@ function ensureCert() {
     fs.mkdirSync(CERT_DIR, { recursive: true });
     execFileSync('openssl', [
       'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '365',
-      '-keyout', key, '-out', cert, '-subj', '/CN=unisson',
+      '-keyout', key, '-out', cert, '-subj', '/CN=sync-prototype',
       '-addext', `subjectAltName=DNS:localhost,${ips.map((ip) => `IP:${ip}`).join(',')}`,
     ], { stdio: 'ignore' });
     fs.writeFileSync(stamp, wanted);
@@ -210,7 +211,7 @@ function ensureCert() {
 
 http.createServer(listener).listen(HTTP_PORT, () => {
   https.createServer(ensureCert(), listener).listen(HTTPS_PORT, () => {
-    console.log('Unisson prêt.');
+    console.log(`${BRAND} prêt.`);
     console.log(`  Sur cet ordinateur : http://localhost:${HTTP_PORT}`);
     for (const ip of lanAddresses()) console.log(`  Sur le réseau local : https://${ip}:${HTTPS_PORT}  (accepter l'avertissement de certificat)`);
     console.log(auth.googleEnabled ? `  Connexion Google active, retour sur ${PUBLIC_URL}/auth/callback` : '  Connexion Google non configurée : connexion de développement, depuis cet ordinateur seulement.');

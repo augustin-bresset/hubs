@@ -1,5 +1,9 @@
 // Page d'accueil : rejoindre une salle par son code, se connecter, créer et gérer ses salles.
+import { BRAND } from './brand.js';
+
 const $ = (id) => document.getElementById(id);
+for (const el of document.querySelectorAll('[data-brand]')) el.textContent = BRAND;
+document.title = BRAND;
 
 const api = async (path, options = {}) => {
   const r = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', ...options.headers } });
