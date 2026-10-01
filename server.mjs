@@ -31,6 +31,7 @@ const MIME = {
 };
 
 const now = () => performance.now();
+const BOOT = randomUUID(); // l'horloge repart de zéro à chaque démarrage : les pages doivent le savoir
 
 // --- État partagé -----------------------------------------------------------
 
@@ -172,7 +173,7 @@ async function handle(req, res) {
   const p = url.pathname;
 
   if (p === '/api/time') {
-    res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store', 'X-Boot': BOOT });
     return res.end(String(now()));
   }
 

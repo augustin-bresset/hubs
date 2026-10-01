@@ -77,6 +77,12 @@ async function pingClock() {
   const t = Number(await r.text());
   const t1 = performance.now();
   const c = S.clock;
+  const boot = r.headers.get('x-boot');
+  if (boot !== c.boot) {
+    // Serveur redémarré : les mesures faites avec l'ancienne horloge ne valent plus rien.
+    c.boot = boot;
+    c.samples = [];
+  }
   c.samples.push({ rtt: t1 - t0, offset: t - (t0 + t1) / 2, at: t1 });
   c.samples = c.samples.filter((s) => t1 - s.at < 30000).slice(-90);
   // L'aller-retour le plus court est le moins perturbé, donc le plus symétrique.
