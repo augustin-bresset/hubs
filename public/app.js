@@ -1,4 +1,5 @@
 import { makeChirp, detectChirp, median } from './dsp.js';
+import { fitClock, localToServer, serverToLocal } from './sync.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -24,7 +25,7 @@ const S = {
   master: null,
   chirpBus: null,
   chirpBuf: null,
-  clock: { offset: 0, rtt: Infinity, samples: [] }, // heure serveur = performance.now() + offset
+  clock: { a: 0, b: 0, t0: 0, rtt: Infinity, samples: [] }, // voir fitClock : heure serveur à partir de performance.now()
   deltas: [],
   ctxDelta: 0, // performance.now()/1000 - ctx.currentTime
   latencyMs: 0,
@@ -84,11 +85,8 @@ async function pingClock() {
     c.samples = [];
   }
   c.samples.push({ rtt: t1 - t0, offset: t - (t0 + t1) / 2, at: t1 });
-  c.samples = c.samples.filter((s) => t1 - s.at < 30000).slice(-90);
-  // L'aller-retour le plus court est le moins perturbé, donc le plus symétrique.
-  const best = c.samples.reduce((a, b) => (b.rtt < a.rtt ? b : a));
-  c.offset = best.offset;
-  c.rtt = best.rtt;
+  c.samples = c.samples.filter((s) => t1 - s.at < 60000).slice(-200);
+  Object.assign(c, fitClock(c.samples));
 }
 
 async function clockLoop() {
@@ -125,9 +123,9 @@ function ctxDeltaLoop() {
   setTimeout(ctxDeltaLoop, 25 + Math.random() * 50);
 }
 
-const serverNow = () => performance.now() + S.clock.offset;
-const serverToCtx = (ms) => (ms - S.clock.offset) / 1000 - S.ctxDelta;
-const ctxToServer = (t) => (t + S.ctxDelta) * 1000 + S.clock.offset;
+const serverNow = () => localToServer(S.clock, performance.now());
+const serverToCtx = (ms) => serverToLocal(S.clock, ms) / 1000 - S.ctxDelta;
+const ctxToServer = (t) => localToServer(S.clock, (t + S.ctxDelta) * 1000);
 
 // --- Lecture ----------------------------------------------------------------
 
