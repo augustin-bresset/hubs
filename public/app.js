@@ -1,4 +1,4 @@
-import { makeChirp, detectChirp, median, PROBE, makeBandstop, MusicAnalyzer } from './dsp.js';
+import { makeChirp, detectChirp, median, PROBE, makeBandstop, MusicAnalyzer, GapTracker } from './dsp.js';
 import { fitClock, localToServer, serverToLocal, gapCorrections } from './sync.js';
 
 const $ = (id) => document.getElementById(id);
@@ -66,6 +66,7 @@ const S = {
   notchDelay: 0, // retard (s) ajouté par le filtre, compensé au lancement de la lecture
   notchChangedMs: 0, // heure serveur du dernier changement de filtre
   trackRunning: false,
+  gapTracker: null, // mémoire du suivi d'une fenêtre à l'autre (appareils faibles)
   trackWait: '', // pourquoi le suivi ne mesure pas en ce moment
   trackCenterMs: 0, // décalage commun (trajet du micro) autour duquel chercher les signatures
   lastTrack: null,
@@ -525,18 +526,21 @@ async function trackingLoop() {
     await ensureRecorder();
     S.chunks = [];
     S.recorder.port.postMessage({ on: true });
+    S.gapTracker = new GapTracker(S.ctx.sampleRate, { scoreMin: TRACK_SCORE_MIN, levelMin: TRACK_LEVEL_MIN_DB, minBlocks: TRACK_BLOCKS / 2 });
     let notBefore = serverNow();
     while (active()) {
       const result = await analyzeTracking(notBefore, active);
       if (!result) break;
       S.trackWait = result.waiting ?? '';
       if (result.waiting) {
+        S.gapTracker.reset(); // lecture ou appareils modifiés : les écarts mémorisés ne valent plus
         render();
         await sleep(500);
         continue;
       }
       await cmd('calibResult', { result });
       uploadCapture(result).catch((err) => log('capture non envoyée :', err.message));
+      if (result.corrections.length) S.gapTracker.reset();
       notBefore = serverNow() + (result.corrections.length ? TRACK_SETTLE_MS : 0);
     }
   } catch (err) {
@@ -601,7 +605,7 @@ async function analyzeTracking(notBefore, active) {
     }
     results ??= pass;
   }
-  results ??= devices.map((c) => ({ client: c.id, name: c.name, detected: false, ms: null, psr: 0, driftPpm: 0, levelDb: null }));
+  results ??= devices.map((c) => ({ client: c.id, name: c.name, detected: false, ms: null, psr: 0, driftPpm: 0, levelDb: null, windows: 1 }));
 
   const found = results.filter((r) => r.detected);
   if (found.length) S.trackCenterMs = found.reduce((sum, r) => sum + r.ms, 0) / found.length;
@@ -612,7 +616,8 @@ async function analyzeTracking(notBefore, active) {
     mic: S.micLabel,
     windowStartMs: start,
     results,
-    corrections: gapCorrections(found.map((r) => ({ client: r.client, ms: r.ms }))),
+    // Une mesure cumulée sur plusieurs fenêtres est moins précise : pas plus prudents.
+    corrections: gapCorrections(found.map((r) => ({ client: r.client, ms: r.ms })), found.some((r) => r.windows > 1) ? { maxStepMs: 5 } : undefined),
   };
 }
 
@@ -641,13 +646,13 @@ async function correlateWindow(start, centerMs, devices, pb, buf) {
     analyzer.addBlock(ref, data.subarray(x0, x0 + len), offsetS);
     if (b % 8 === 7) await sleep(0); // laisse respirer l'interface
   }
-  const out = analyzer.results();
+  // Un appareil est reconnu si son pic est net, loin du bord de la plage, et si sa bande contient
+  // vraiment de la musique (une bande presque vide ne porte que les restes du filtrage des autres).
+  // Faute de pic net dans cette fenêtre, GapTracker la cumule avec les précédentes.
+  const out = S.gapTracker.update(analyzer);
   return devices.map((c) => {
     const r = out.get(c.id);
-    // Reconnu si le pic est net, loin du bord de la plage, et si sa bande contient vraiment de la
-    // musique : une bande presque vide ne porte que les restes du filtrage des autres appareils.
-    const detected = r.blocks >= TRACK_BLOCKS / 2 && r.score >= TRACK_SCORE_MIN && !r.edge && r.level >= TRACK_LEVEL_MIN_DB;
-    return { client: c.id, name: c.name, detected, ms: detected ? centerMs + (r.lag / sr) * 1000 : null, psr: r.score, driftPpm: r.drift * 1e6, levelDb: r.level };
+    return { client: c.id, name: c.name, detected: r.detected, ms: r.detected ? centerMs + (r.lag / sr) * 1000 : null, psr: r.score, driftPpm: r.drift * 1e6, levelDb: r.level, windows: r.windows };
   });
 }
 
@@ -806,7 +811,10 @@ const nameOf = (res, client) => res.results.find((r) => r.client === client)?.na
 function relativeValues(res) {
   const ok = res.results.filter((r) => r.detected);
   const ref = ok.find((r) => r.client === res.listener) ?? ok[0];
-  return res.results.map((r) => `${r.name} ${!r.detected ? 'non détecté' : r === ref ? 'référence' : `${signed(r.ms - ref.ms)} ms`}`).join(' · ');
+  return res.results.map((r) => {
+    const value = !r.detected ? (r.windows > 1 ? `trop faible pour l'instant, cumul en cours (${r.windows})` : 'non détecté') : r === ref ? 'référence' : `${signed(r.ms - ref.ms)} ms`;
+    return `${r.name} ${value}${r.detected && r.windows > 1 ? ` (cumul de ${r.windows} mesures)` : ''}`;
+  }).join(' · ');
 }
 
 function renderTracking() {

@@ -5,11 +5,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { PROBE, MusicAnalyzer } from '../public/dsp.js';
+import { PROBE, MusicAnalyzer, GapTracker } from '../public/dsp.js';
 
 const dir = process.argv[2] ?? new URL('../captures', import.meta.url).pathname;
 const BLOCKS = 32;
 const music = new Map(); // « id@fréquence » -> échantillons mono
+// Mêmes réglages que la page (TRACK_* dans public/app.js).
+let tracker = null;
 
 function loadTrack(id, sampleRate) {
   const key = `${id}@${sampleRate}`;
@@ -44,10 +46,12 @@ for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort()
     for (let i = 0; i < PROBE.block; i++) block[i] = ref[(((q + i) % ref.length) + ref.length) % ref.length];
     analyzer.addBlock(block, rec.subarray(x0, x0 + len), offsetS);
   }
-  const res = analyzer.results();
+  tracker ??= new GapTracker(sr, { scoreMin: 12, levelMin: -30, minBlocks: BLOCKS / 2 });
+  const res = tracker.update(analyzer);
   const parts = devices.map((c) => {
     const r = res.get(c.id);
-    return `${c.name} : ${((r.lag / sr) * 1000 + meta.centerMs).toFixed(1).padStart(6)} ms, score ${r.score.toFixed(1).padStart(6)}, niveau ${r.level.toFixed(0).padStart(4)} dB${r.edge ? ', bord' : ''}`;
+    const where = r.detected ? `${((r.lag / sr) * 1000 + meta.centerMs).toFixed(1).padStart(6)} ms` : 'non reconnu';
+    return `${c.name} : ${where}, score ${r.score.toFixed(1).padStart(6)}, niveau ${r.level.toFixed(0).padStart(4)} dB${r.windows > 1 ? `, cumul de ${r.windows} fenêtres` : ''}`;
   });
   console.log(`${label} | ${parts.join(' | ')}`);
 }

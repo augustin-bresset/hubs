@@ -50,7 +50,9 @@ du son (mode « appel », profil Bluetooth mains-libres) et fausser la mesure.
   leur musique. Le micro corrèle ce qu'il entend avec la musique dans la bande de chaque appareil,
   par blocs de 171 ms dont on additionne les énergies pendant 5,5 s, et chacun est ramené vers la
   moyenne du groupe. Rien n'est ajouté au son, et un appareil bien moins fort que les autres reste
-  mesurable puisqu'il est seul dans sa bande. Quatre appareils au plus.
+  mesurable puisqu'il est seul dans sa bande ; s'il est trop faible ou trop réverbéré pour ressortir en
+  une fenêtre, les fenêtres successives sont cumulées, recalées sur l'appareil le mieux reconnu.
+  Quatre appareils au plus.
 - **Sortie maintenue éveillée** : chaque page joue en permanence un bruit infime (−80 dB), pour que la
   sortie audio ne se mette pas en veille pendant les silences et ne change pas de latence au réveil.
 

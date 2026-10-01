@@ -105,7 +105,7 @@ function recordCalib(result) {
   const parts = entry.results.map((r) => {
     const value = r.detected ? `${fmt(r.ms)}ms` : 'non détecté';
     const detail = entry.mode === 'track'
-      ? `score ${fmt(r.psr)}, niveau ${r.levelDb == null ? '–' : `${Math.round(r.levelDb)} dB`}, glissement ${Math.round(r.driftPpm ?? 0)} ppm`
+      ? `score ${fmt(r.psr)}, niveau ${r.levelDb == null ? '–' : `${Math.round(r.levelDb)} dB`}${r.windows > 1 ? `, cumul ${r.windows}` : ''}`
       : `dispersion ${fmt(r.spreadMs)}, ${r.hits}/${r.reps}, score ${Math.round(Math.min(r.psr, 999))}`;
     return `${r.name}=${value} (${detail}, comp ${fmt(r.compMs)})`;
   });

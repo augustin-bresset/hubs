@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PROBE, fft, makeBandstop, MusicAnalyzer } from '../public/dsp.js';
+import { PROBE, fft, makeBandstop, MusicAnalyzer, GapTracker } from '../public/dsp.js';
 import { gapCorrections } from '../public/sync.js';
 
 const SR = 48000;
@@ -137,5 +137,53 @@ test('sans aucun bruit, les restes du filtrage ne passent pas pour un appareil',
 test('un silence dans la musique ne produit pas de mesure', () => {
   const analyzer = new MusicAnalyzer(SR, new Map([[0, PROBE.bands[0]]]));
   analyzer.addBlock(new Float32Array(PROBE.block), new Float32Array(PROBE.block + 2 * PROBE.maxLag), 0);
-  assert.deepEqual(analyzer.results().get(0), { lag: 0, drift: 0, score: 0, blocks: 0, level: -Infinity, edge: false });
+  assert.deepEqual(analyzer.results().get(0), { lag: 0, drift: 0, score: 0, blocks: 0, level: -Infinity, edge: false, driftIndex: 0, k0: 0 });
+});
+
+// Faux analyseur : un appareil net (« fort ») et un appareil dont le pic dépasse à peine le fond
+// (« faible »), 40 échantillons après le premier. `shift` déplace les deux ensemble, comme le fait
+// le trajet du micro d'une fenêtre à l'autre.
+function fakeWindow(seed, shift, weakPeak = 2.5) {
+  const rand = rng(seed), n = 2 * PROBE.maxLag + 1, width = 80;
+  // Fond lissé sur 80 échantillons, comme l'est une vraie enveloppe de corrélation dans une bande étroite.
+  const noisy = (center, height) => {
+    const white = Float32Array.from({ length: n + width }, () => rand());
+    let acc = 0;
+    for (let i = 0; i < width; i++) acc += white[i];
+    return Float32Array.from({ length: n }, (_, i) => {
+      acc += white[i + width] - white[i];
+      return 1 + acc / Math.sqrt(width) + height * Math.exp(-(((i - center) / 40) ** 2));
+    });
+  };
+  const strongAt = PROBE.maxLag + shift;
+  const profiles = { fort: noisy(strongAt, 60), faible: noisy(strongAt + 40, weakPeak) };
+  return {
+    results: () => new Map([
+      ['fort', { lag: shift, drift: 0, score: 80, blocks: 32, level: 0, edge: false, driftIndex: 8, k0: shift }],
+      ['faible', { lag: 1234, drift: 0, score: 5, blocks: 32, level: -20, edge: false, driftIndex: 3, k0: 1234 }],
+    ]),
+    profile: (key) => profiles[key],
+  };
+}
+
+test('GapTracker : un appareil faible est reconnu en cumulant plusieurs fenêtres', () => {
+  const tracker = new GapTracker(SR, { scoreMin: 12, levelMin: -30, minBlocks: 16 });
+  const seen = [];
+  [300, -120, 55, 410, -260, 90].forEach((shift, i) => {
+    const r = tracker.update(fakeWindow(i + 1, shift));
+    assert.deepEqual([r.get('fort').detected, r.get('fort').lag], [true, shift]);
+    seen.push(r.get('faible'));
+    if (r.get('faible').detected) assert.ok(Math.abs(r.get('faible').lag - (shift + 40)) <= 25, `retard ${r.get('faible').lag}, attendu ${shift + 40}`);
+  });
+  console.log(`appareil faible, fenêtre par fenêtre : ${seen.map((r) => `${r.detected ? 'oui' : 'non'} (${r.score.toFixed(1)})`).join(', ')}`);
+  assert.deepEqual(seen.slice(0, 2).map((r) => r.detected), [false, false], 'pas avant trois fenêtres');
+  assert.ok(seen[5].detected && seen[5].windows === 6);
+
+  tracker.reset();
+  assert.equal(tracker.update(fakeWindow(9, 10)).get('faible').detected, false, 'le cumul repart de zéro après reset');
+});
+
+test('GapTracker : sans rien dans sa bande, un appareil n’est jamais reconnu', () => {
+  const tracker = new GapTracker(SR, { scoreMin: 12, levelMin: -30, minBlocks: 16 });
+  for (let i = 0; i < 8; i++) assert.equal(tracker.update(fakeWindow(20 + i, 7 * i, 0)).get('faible').detected, false);
 });
