@@ -112,179 +112,149 @@ export function median(values) {
   return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
 }
 
-// --- Suivi continu : signature propre à chaque appareil ---------------------
-// Chaque appareil joue en boucle, à bas niveau, un bruit à bande limitée qui lui est propre.
-// Le micro de référence retrouve chaque signature par corrélation et en déduit son retard.
-// La corrélation se fait par blocs courts dont on additionne les énergies : un bloc de 171 ms
-// reste cohérent malgré les petites variations de vitesse des horloges, ce qu'une corrélation
-// d'un seul tenant sur plusieurs secondes ne tolère pas.
+// --- Suivi continu par la musique -------------------------------------------
+// La musique sert elle-même de signal de mesure : elle est connue de tous et bien plus forte que
+// n'importe quel bruit caché. Pour savoir quelle copie vient de quel appareil, chacun dispose d'une
+// bande de fréquences où il est le seul à la jouer (les autres l'y retirent). Dans cette bande, le
+// micro n'entend que lui, même s'il est beaucoup moins fort que les autres.
 
-export const SIG = {
-  rate: 48000, // fréquence d'échantillonnage de référence de la signature
-  length: 65536, // une période : 1,365 s
-  f0: 2000,
-  f1: 6000,
-  block: 8192, // 171 ms
+export const PROBE = {
+  block: 8192,
   fftSize: 16384,
-  maxLag: 4096, // retard recherché : ±85 ms autour de l'instant attendu
+  maxLag: 4096, // retard recherché : ±85 ms à 48 kHz autour de l'instant attendu
+  // Une bande (Hz) par emplacement d'appareil.
+  bands: [[3400, 4000], [4300, 4900], [5300, 5900], [6300, 6900]],
+  margin: 70, // Hz écartés de chaque bord pour la mesure : zone de transition du filtre
+  taps: 4097, // longueur du filtre coupe-bande ; il retarde le son de (taps - 1) / 2 échantillons
 };
-const SIG_K0 = Math.ceil((SIG.f0 * SIG.fftSize) / SIG.rate);
-const SIG_K1 = Math.floor((SIG.f1 * SIG.fftSize) / SIG.rate);
-const SIG_SMOOTH = 12; // lissage du profil sur 0,25 ms : la largeur d'un pic de corrélation
-const SIG_GUARD = 960; // 20 ms autour du pic, exclus du calcul du bruit de fond
-// Hypothèses de glissement du retard : -400 à +400 ppm par pas de 50.
-const SIG_DRIFTS = Array.from({ length: 17 }, (_, i) => (i - 8) * 50e-6);
+// Hypothèses de glissement du retard pendant la fenêtre : -400 à +400 ppm par pas de 50.
+const DRIFTS = Array.from({ length: 17 }, (_, i) => (i - 8) * 50e-6);
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+const sinc = (x) => (x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x));
 
-// Signature n° `code` : spectre plat entre f0 et f1, phases pseudo-aléatoires, RMS 1.
-// Périodique de période SIG.length à SIG.rate ; le même code donne le même signal partout.
-export function makeSignature(code) {
-  const n = SIG.length;
-  const re = new Float64Array(n), im = new Float64Array(n);
-  const rand = mulberry32(Math.imul(code + 1, 0x9e3779b1));
-  const k0 = Math.ceil((SIG.f0 * n) / SIG.rate), k1 = Math.floor((SIG.f1 * n) / SIG.rate);
-  for (let k = k0; k <= k1; k++) {
-    const phase = 2 * Math.PI * rand();
-    re[k] = re[n - k] = Math.cos(phase);
-    im[k] = -Math.sin(phase); // spectre conjugué : la FFT directe sert de FFT inverse
-    im[n - k] = Math.sin(phase);
+// Réponse impulsionnelle d'un filtre à phase linéaire qui retire les bandes [f1, f2] données et
+// laisse le reste intact. Sans bande, c'est un simple retard : tous les appareils gardent ainsi
+// le même délai, qu'ils filtrent ou non.
+export function makeBandstop(sampleRate, bands, taps = PROBE.taps) {
+  const h = new Float32Array(taps);
+  const mid = (taps - 1) / 2;
+  h[mid] = 1;
+  for (const [f1, f2] of bands) {
+    for (let n = 0; n < taps; n++) {
+      const m = n - mid;
+      const blackman = 0.42 - 0.5 * Math.cos((2 * Math.PI * n) / (taps - 1)) + 0.08 * Math.cos((4 * Math.PI * n) / (taps - 1));
+      const a = (2 * f1) / sampleRate, b = (2 * f2) / sampleRate;
+      h[n] -= blackman * (b * sinc(b * m) - a * sinc(a * m));
+    }
   }
-  fft(re, im);
-  let energy = 0;
-  for (let i = 0; i < n; i++) energy += re[i] * re[i];
-  const scale = 1 / Math.sqrt(energy / n);
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) out[i] = re[i] * scale;
-  return out;
+  return h;
 }
 
-// Spectre de chaque bloc de la signature, réduit à la bande utile.
-export function signatureTemplates(sig) {
-  const blocks = [];
-  const re = new Float64Array(SIG.fftSize), im = new Float64Array(SIG.fftSize);
-  for (let start = 0; start + SIG.block <= sig.length; start += SIG.block) {
-    re.fill(0);
-    im.fill(0);
-    re.set(sig.subarray(start, start + SIG.block));
-    fft(re, im);
-    blocks.push({ re: Float32Array.from(re.subarray(SIG_K0, SIG_K1 + 1)), im: Float32Array.from(im.subarray(SIG_K0, SIG_K1 + 1)) });
-  }
-  return blocks;
-}
-
-// Accumule, bloc après bloc, le profil de corrélation de chaque signature recherchée.
-// Pendant les quelques secondes d'une fenêtre, le retard glisse (horloges qui ne tournent pas à la
-// même vitesse) : on accumule un profil par hypothèse de glissement et on garde la meilleure.
-export class SignatureAnalyzer {
-  // templates : Map clé d'appareil -> signatureTemplates(...)
-  constructor(templates) {
-    this.templates = templates;
-    this.size = 2 * SIG.maxLag + 1;
-    this.profiles = new Map([...templates.keys()].map((key) => [key, SIG_DRIFTS.map(() => new Float64Array(this.size))]));
-    this.re = new Float64Array(SIG.fftSize);
-    this.im = new Float64Array(SIG.fftSize);
-    this.cr = new Float64Array(SIG.fftSize);
-    this.ci = new Float64Array(SIG.fftSize);
+// Mesure, bande par bande, le retard entre la musique de référence et ce que le micro a entendu.
+// La corrélation se fait par blocs de 171 ms dont on additionne les énergies, en essayant plusieurs
+// glissements d'horloge : un bloc reste cohérent malgré les petites variations de vitesse, ce
+// qu'une corrélation d'un seul tenant sur plusieurs secondes ne tolère pas.
+export class MusicAnalyzer {
+  // bands : Map clé d'appareil -> [f1, f2], la bande où cet appareil est seul à jouer.
+  constructor(sampleRate, bands) {
+    this.sampleRate = sampleRate;
+    this.size = 2 * PROBE.maxLag + 1;
+    this.bands = new Map();
+    for (const [key, [f1, f2]] of bands) {
+      const k0 = Math.ceil(((f1 + PROBE.margin) * PROBE.fftSize) / sampleRate);
+      const k1 = Math.floor(((f2 - PROBE.margin) * PROBE.fftSize) / sampleRate);
+      // Fenêtre de Hann sur la bande : évite les rebonds de la corrélation de part et d'autre du pic.
+      const taper = Float32Array.from({ length: k1 - k0 + 1 }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * (i + 1)) / (k1 - k0 + 2)));
+      this.bands.set(key, { k0, k1, taper, blocks: 0, profiles: DRIFTS.map(() => new Float64Array(this.size)) });
+    }
+    const n = PROBE.fftSize;
+    Object.assign(this, { rr: new Float64Array(n), ri: new Float64Array(n), xr: new Float64Array(n), xi: new Float64Array(n), cr: new Float64Array(n), ci: new Float64Array(n) });
     this.tMin = Infinity;
     this.tMax = -Infinity;
   }
 
-  // slice : SIG.block + 2 * SIG.maxLag échantillons à SIG.rate, qui commencent SIG.maxLag
-  // avant l'instant où le bloc n° `block` de la signature est attendu.
-  // timeS : instant de ce bloc (s), sur une échelle commune à tous les blocs de la fenêtre.
-  addBlock(block, slice, timeS) {
-    const { re, im, cr, ci, size } = this;
-    re.fill(0);
-    im.fill(0);
-    re.set(slice);
-    fft(re, im);
-    // Blanchiment : chaque fréquence pèse autant, quelle que soit l'énergie de la musique.
-    let mean = 0;
-    for (let k = SIG_K0; k <= SIG_K1; k++) mean += Math.hypot(re[k], im[k]);
-    const eps = (1e-3 * mean) / (SIG_K1 - SIG_K0 + 1) + 1e-12;
-    for (let k = SIG_K0; k <= SIG_K1; k++) {
-      const m = Math.hypot(re[k], im[k]) + eps;
-      re[k] /= m;
-      im[k] /= m;
-    }
-    for (const [key, blocks] of this.templates) {
-      const t = blocks[block];
+  // ref : PROBE.block échantillons de la musique de référence.
+  // slice : PROBE.block + 2 * PROBE.maxLag échantillons du micro, qui commencent PROBE.maxLag
+  // avant l'instant où ce bloc de musique est attendu.
+  // timeS : instant du bloc (s), sur une échelle commune à tous les blocs de la fenêtre.
+  addBlock(ref, slice, timeS) {
+    const { rr, ri, xr, xi, cr, ci, size } = this;
+    rr.fill(0); ri.fill(0); xr.fill(0); xi.fill(0);
+    rr.set(ref);
+    xr.set(slice);
+    fft(rr, ri);
+    fft(xr, xi);
+    for (const band of this.bands.values()) {
+      const { k0, k1, taper } = band;
+      let energy = 0, mean = 0;
+      for (let k = k0; k <= k1; k++) {
+        energy += rr[k] * rr[k] + ri[k] * ri[k];
+        mean += Math.hypot(rr[k], ri[k]) * Math.hypot(xr[k], xi[k]);
+      }
+      if (energy < 1e-12) continue; // silence dans cette bande : rien à mesurer
+      const eps = (1e-3 * mean) / (k1 - k0 + 1) + 1e-20;
       cr.fill(0);
       ci.fill(0);
-      for (let k = SIG_K0; k <= SIG_K1; k++) {
-        const tr = t.re[k - SIG_K0], ti = t.im[k - SIG_K0];
-        cr[k] = re[k] * tr + im[k] * ti;
-        ci[k] = -(im[k] * tr - re[k] * ti); // conjugué de X·conj(T) : FFT directe = FFT inverse
+      for (let k = k0; k <= k1; k++) {
+        // Spectre croisé normalisé : seule la phase compte, chaque fréquence pèse autant.
+        const gr = xr[k] * rr[k] + xi[k] * ri[k], gi = xi[k] * rr[k] - xr[k] * ri[k];
+        const w = taper[k - k0] / (Math.hypot(xr[k], xi[k]) * Math.hypot(rr[k], ri[k]) + eps);
+        cr[k] = gr * w;
+        ci[k] = -gi * w; // conjugué : la FFT directe sert de FFT inverse
       }
       fft(cr, ci);
-      for (let i = 0; i < size; i++) cr[i] *= cr[i];
-      const profiles = this.profiles.get(key);
-      for (let h = 0; h < SIG_DRIFTS.length; h++) {
+      // Fréquences positives seules : le module est l'enveloppe de la corrélation.
+      for (let i = 0; i < size; i++) cr[i] = cr[i] * cr[i] + ci[i] * ci[i];
+      for (let h = 0; h < DRIFTS.length; h++) {
         // Ramène le retard de ce bloc à ce qu'il vaudrait à l'instant 0 sous cette hypothèse.
-        const shift = Math.round(SIG_DRIFTS[h] * timeS * SIG.rate);
-        const profile = profiles[h];
+        const shift = Math.round(DRIFTS[h] * timeS * this.sampleRate);
+        const profile = band.profiles[h];
         const from = Math.max(0, shift), to = Math.min(size, size + shift);
         for (let i = from; i < to; i++) profile[i - shift] += cr[i];
       }
+      band.blocks++;
     }
     this.tMin = Math.min(this.tMin, timeS);
     this.tMax = Math.max(this.tMax, timeS);
   }
 
-  // Par appareil : retard au milieu de la fenêtre (en échantillons à SIG.rate, par rapport à
-  // l'instant attendu), glissement retenu et score (hauteur du pic en écarts-types du bruit de fond).
+  // Par appareil : retard au milieu de la fenêtre (en échantillons, par rapport à l'instant
+  // attendu), glissement retenu, score (hauteur du pic en écarts-types du bruit de fond) et
+  // nombre de blocs utilisés.
   results() {
     const out = new Map();
     const tMid = (this.tMin + this.tMax) / 2;
-    for (const [key, profiles] of this.profiles) {
-      let best = null;
-      for (let h = 0; h < SIG_DRIFTS.length; h++) {
-        const smooth = boxcar(profiles[h], SIG_SMOOTH);
-        let max = -Infinity, kmax = 0;
-        for (let i = 0; i < smooth.length; i++) if (smooth[i] > max) { max = smooth[i]; kmax = i; }
-        if (!best || max > best.max) best = { smooth, max, kmax, drift: SIG_DRIFTS[h] };
+    const guard = Math.round(0.006 * this.sampleRate);
+    for (const [key, band] of this.bands) {
+      if (band.blocks === 0) {
+        out.set(key, { lag: 0, drift: 0, score: 0, blocks: 0 });
+        continue;
       }
-      const { smooth, max, kmax, drift } = best;
+      let best = null;
+      for (let h = 0; h < DRIFTS.length; h++) {
+        const profile = band.profiles[h];
+        let max = -Infinity, kmax = 0;
+        for (let i = 0; i < profile.length; i++) if (profile[i] > max) { max = profile[i]; kmax = i; }
+        if (!best || max > best.max) best = { profile, max, kmax, drift: DRIFTS[h] };
+      }
+      const { profile, max, kmax, drift } = best;
       let sum = 0, sum2 = 0, count = 0;
-      for (let i = 0; i < smooth.length; i++) {
-        if (Math.abs(i - kmax) <= SIG_GUARD) continue;
-        sum += smooth[i];
-        sum2 += smooth[i] * smooth[i];
+      for (let i = 0; i < profile.length; i++) {
+        if (Math.abs(i - kmax) <= guard) continue;
+        sum += profile[i];
+        sum2 += profile[i] * profile[i];
         count++;
       }
       const mean = sum / count;
       const std = Math.sqrt(Math.max(sum2 / count - mean * mean, 0));
-      // Trajet direct : premier pic comparable dans les 20 ms qui précèdent le maximum.
-      let first = kmax;
-      const floor = mean + 0.5 * (max - mean);
-      for (let i = Math.max(1, kmax - SIG_GUARD); i < kmax; i++) {
-        if (smooth[i] >= floor && smooth[i] >= smooth[i - 1] && smooth[i] >= smooth[i + 1]) { first = i; break; }
+      // Sommet de la parabole passant par le maximum et ses deux voisins.
+      let peak = kmax;
+      if (kmax > 0 && kmax < profile.length - 1) {
+        const a = profile[kmax - 1], b = profile[kmax], c = profile[kmax + 1];
+        if (a - 2 * b + c < 0) peak += (0.5 * (a - c)) / (a - 2 * b + c);
       }
-      out.set(key, { lag: first - SIG.maxLag + drift * tMid * SIG.rate, drift, score: std > 0 ? (max - mean) / std : 0 });
+      out.set(key, { lag: peak - PROBE.maxLag + drift * tMid * this.sampleRate, drift, score: std > 0 ? (max - mean) / std : 0, blocks: band.blocks });
     }
     return out;
   }
-}
-
-// Moyenne glissante centrée (somme sur `width` points).
-function boxcar(values, width) {
-  const n = values.length, half = width >> 1;
-  const out = new Float64Array(n);
-  let acc = 0;
-  for (let i = 0; i < n + half; i++) {
-    if (i < n) acc += values[i];
-    if (i >= width) acc -= values[i - width];
-    if (i >= half) out[i - half] = acc;
-  }
-  return out;
 }
