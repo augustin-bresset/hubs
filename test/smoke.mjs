@@ -9,7 +9,8 @@ import { spawn } from 'node:child_process';
 import puppeteer from 'puppeteer-core';
 
 const HTTP_PORT = 18080, HTTPS_PORT = 18443;
-const CAPTURE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-captures-'));
+// KEEP_CAPTURES=dossier garde les enregistrements du micro, pour essayer tools/analyze-capture.mjs.
+const CAPTURE_DIR = process.env.KEEP_CAPTURES ?? fs.mkdtempSync(path.join(os.tmpdir(), 'sync-captures-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Clic déclenché dans la page : le clic « souris » de puppeteer attend un rendu qui n'arrive jamais dans un onglet en arrière-plan.
 const click = (page, selector) => page.$eval(selector, (el) => el.click());
@@ -175,5 +176,5 @@ try {
 } finally {
   await browser.close();
   server.kill();
-  fs.rmSync(CAPTURE_DIR, { recursive: true, force: true });
+  if (!process.env.KEEP_CAPTURES) fs.rmSync(CAPTURE_DIR, { recursive: true, force: true });
 }

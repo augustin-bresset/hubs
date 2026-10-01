@@ -28,9 +28,8 @@ Aucune dépendance pour le serveur (Node 18+, `openssl` pour générer le certif
 6. **Test de stabilité** : dix mesures à la suite, sans toucher à la compensation. Le résumé donne la
    variation de l'écart entre appareils ; c'est elle qui dit si une calibration unique suffit.
 
-7. **Suivi continu** (après une calibration) : chaque appareil joue en permanence une signature très
-   discrète, l'appareil qui écoute mesure les écarts toutes les 6 à 10 s et les corrige, y compris
-   pendant la musique. Le curseur règle le niveau de la signature : le plus bas qui reste détecté.
+7. **Suivi continu** (après une calibration, pendant que la musique joue) : l'appareil qui écoute
+   mesure l'écart entre appareils toutes les 6 à 10 s dans la musique elle-même et le corrige.
 
 Chaque mesure est gardée dans l'historique de la page et écrite dans la sortie du serveur.
 
@@ -46,18 +45,23 @@ du son (mode « appel », profil Bluetooth mains-libres) et fausser la mesure.
 - **Calibration** : un balayage 1–6 kHz de 150 ms par créneau ; l'appareil qui écoute le retrouve par
   corrélation croisée (`public/dsp.js`). Un seul micro mesure tout le monde, donc sa propre latence
   s'annule dans les écarts.
-- **Suivi continu** : la signature de chaque appareil est un bruit à bande limitée (2–6 kHz) qui lui est
-  propre, calé sur l'horloge commune comme la musique. Le micro la retrouve par corrélation sur des
-  blocs de 171 ms dont on additionne les énergies pendant 5,5 s, en essayant plusieurs glissements
-  d'horloge. Seuls les écarts entre appareils servent : chacun est ramené vers la moyenne du groupe.
+- **Suivi continu** : la musique sert de signal de mesure. Chaque appareil a une bande de 600 Hz
+  (entre 3,4 et 6,9 kHz) où il est le seul à la jouer : pendant le suivi, les autres la retirent de
+  leur musique. Le micro corrèle ce qu'il entend avec la musique dans la bande de chaque appareil,
+  par blocs de 171 ms dont on additionne les énergies pendant 5,5 s, et chacun est ramené vers la
+  moyenne du groupe. Rien n'est ajouté au son, et un appareil bien moins fort que les autres reste
+  mesurable puisqu'il est seul dans sa bande. Quatre appareils au plus.
 - **Sortie maintenue éveillée** : chaque page joue en permanence un bruit infime (−80 dB), pour que la
   sortie audio ne se mette pas en veille pendant les silences et ne change pas de latence au réveil.
 
 ## Limites connues
 
 - La synchro n'est exacte qu'à l'emplacement du micro (le son parcourt ~3 ms par mètre).
-- Le suivi continu ne rattrape que ±85 ms autour de la calibration et corrige par pas de 15 ms au plus ;
-  au-delà, recalibrer. Il n'a été validé qu'en simulation et en boucle interne.
+- Le suivi continu ne mesure que quand la musique joue et contient de l'énergie entre 3 et 7 kHz. Il
+  corrige par pas de 15 ms au plus. Validé en simulation et en boucle interne (Chrome et Firefox),
+  pas encore avec de vraies enceintes.
+- Pendant le suivi, chaque appareil joue la musique avec une bande étroite en moins.
+- Sous Firefox, la position de lecture flotte d'environ ±1 ms.
 - Le trajet du micro ajoute à toutes les mesures un décalage commun qui dérive : seules les valeurs
   relatives entre appareils sont fiables, les latences absolues ne le sont pas.
 - Sources : métronome ou fichier audio local envoyé depuis la page (gardé en mémoire, 80 Mo max).
@@ -68,7 +72,14 @@ du son (mode « appel », profil Bluetooth mains-libres) et fausser la mesure.
 ## Tests
 
 ```sh
-npm test         # traitement du signal (chirp, signature) et modèle d'horloge
-npm install      # une fois, pour le test suivant
-npm run smoke    # bout en bout dans Chrome sans écran : deux pages, lecture, calibration et suivi en boucle interne
+npm test               # traitement du signal (chirp, mesure par la musique) et modèle d'horloge
+npm install            # une fois, pour les tests suivants
+npm run smoke          # bout en bout dans Chrome sans écran : lecture, calibration, suivi en boucle interne
+npm run smoke:firefox  # le même scénario sous Firefox
 ```
+
+## Diagnostic
+
+Pendant le suivi, l'appareil qui écoute envoie au serveur ce que son micro entend (s'il tourne sur la
+même machine). Les douze dernières fenêtres et le morceau joué sont gardés dans `captures/` ;
+`node tools/analyze-capture.mjs` rejoue la mesure dessus (nécessite `ffmpeg`).
