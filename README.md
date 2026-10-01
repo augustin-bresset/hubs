@@ -59,6 +59,27 @@ Chaque mesure est gardée dans l'historique de la page et écrite dans la sortie
 Mieux vaut que ce soit l'ordinateur qui écoute : sur téléphone, ouvrir le micro peut changer le trajet
 du son (mode « appel », profil Bluetooth mains-libres) et fausser la mesure.
 
+## Direct : l'ordinateur diffuse vers les appareils
+
+Dans une salle, le créateur dispose d'un bloc « En direct depuis cet ordinateur » : il choisit une
+source, un retard, et tout ce qui y joue ressort, synchronisé, sur les appareils de la salle (chacun
+sur son enceinte). Sources possibles :
+
+- **Son d'un onglet** (Chrome ou Edge sur ordinateur) : partager l'onglet où joue la musique en
+  cochant le partage du son. L'onglet est rendu muet sur place, il ressort par le direct.
+- **Entrée audio** : carte son, table de mixage, micro. Attention au micro intégré : il capte la
+  pièce, donc aussi les enceintes.
+- **Câble virtuel**, pour une application ou un logiciel de mix. Sous Linux :
+  `tools/linux-virtual-input.sh on`, puis diriger l'application vers la sortie « Behind-cable » et
+  choisir l'entrée « Behind-source » comme source du direct (`off` pour le retirer). Sous Windows et
+  macOS, des outils comme VB-Cable ou BlackHole jouent le même rôle.
+
+Le retard (1 s par défaut) sépare la capture de l'écoute : il doit dépasser la plus grande
+compensation des appareils d'environ 0,3 s. Il rend le direct inadapté à qui doit entendre son
+propre geste sans délai : pour mixer, on écoute au casque et la salle suit avec ce retard.
+
+Le son voyage en clair et sans compression (environ 1,5 Mbit/s par appareil), via le serveur.
+
 ## Comment ça marche
 
 - **Horloge commune** : chaque page estime son décalage avec l'horloge du serveur (allers-retours HTTP,
@@ -78,6 +99,11 @@ du son (mode « appel », profil Bluetooth mains-libres) et fausser la mesure.
   mieux reconnu sert de référence ; l'écart des autres vient du cumul de leurs six dernières
   fenêtres, recalées sur lui. Les corrections sont prudentes : rien sous 2 ms d'écart, 6 ms au plus
   par pas. Quatre appareils au plus.
+- **Direct** : l'hôte découpe le son capté en tranches de 100 ms, chacune datée de l'heure commune
+  de sa capture. Une droite ajustée sur ces dates donne le rythme réel de sa carte son ; chaque
+  appareil lit le flux avec un lecteur à vitesse variable asservi à cette horloge, pour faire
+  entendre chaque échantillon un retard fixe après sa capture. Le suivi continu s'applique tel quel,
+  la référence étant le flux reçu.
 - **Sortie maintenue éveillée** : chaque page joue en permanence un bruit infime (−80 dB), pour que la
   sortie audio ne se mette pas en veille pendant les silences et ne change pas de latence au réveil.
 
@@ -95,6 +121,8 @@ du son (mode « appel », profil Bluetooth mains-libres) et fausser la mesure.
   Pour un MP3, utiliser le même navigateur partout (le décodage n'ajoute pas le même silence initial
   selon les navigateurs).
 - Écran du téléphone allumé et page au premier plan, sinon le navigateur suspend le son.
+- Direct : validé en boucle interne avec un son de test ; la capture d'une vraie source (onglet, carte
+  son) n'a pas encore été essayée. Pas d'enregistrement de diagnostic pendant un direct.
 
 ## Tests
 
