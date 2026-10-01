@@ -24,6 +24,7 @@ const TRACK_SWEEP_MS = [150, -150, 300, -300, 450, -450, 600, -600];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+const isLocal = ['localhost', '127.0.0.1'].includes(location.hostname);
 
 const S = {
   id: sessionStorage.getItem('unisson.id') || Math.random().toString(36).slice(2, 10),
@@ -514,6 +515,7 @@ async function trackingLoop() {
       const result = await analyzeTracking(start, active);
       if (!result) break;
       await cmd('calibResult', { result });
+      uploadCapture(start, result).catch((err) => log('capture non envoyée :', err.message));
       notBefore = serverNow() + (result.corrections.length ? TRACK_SETTLE_MS : 0);
     }
   } catch (err) {
@@ -522,6 +524,30 @@ async function trackingLoop() {
   S.recorder?.port.postMessage({ on: false });
   S.trackRunning = false;
   if (S.tracking?.on && S.tracking.listener === S.id) cmd('tracking', { on: false }).catch(() => {});
+}
+
+// Envoie au serveur ce que le micro vient d'entendre, avec de quoi le recaler sur l'horloge commune :
+// c'est ce qui permet d'analyser hors ligne une situation où le suivi échoue. Réservé à l'appareil
+// qui héberge le serveur, pour ne pas charger le Wi-Fi.
+async function uploadCapture(start, result) {
+  if (!isLocal) return;
+  const sr = S.ctx.sampleRate;
+  const { first, data } = assembleRecording();
+  const meta = {
+    sampleRate: sr,
+    firstFrame: first,
+    firstServerMs: ctxToServer(first / sr),
+    windowStartMs: start,
+    centerMs: S.trackCenterMs,
+    playback: S.playback,
+    tracking: S.tracking,
+    results: result.results,
+    clients: S.clients,
+    listener: S.id,
+    mic: S.micStream?.getAudioTracks()[0]?.getSettings() ?? null,
+    userAgent: navigator.userAgent,
+  };
+  await fetch('/api/capture', { method: 'POST', headers: { 'X-Meta': encodeURIComponent(JSON.stringify(meta)) }, body: data });
 }
 
 // Mesure le retard de chaque signature sur la fenêtre qui commence à l'heure serveur `start`.
@@ -604,6 +630,8 @@ function reportStatus() {
       sampleRate: ctx.sampleRate,
       reportedMs: ((ctx.outputLatency || 0) + (ctx.baseLatency || 0)) * 1000,
       state: ctx.state,
+      browser: (navigator.userAgent.match(/(Firefox|Chrome|Version)\/[\d.]+/) ?? [''])[0],
+      mic: S.micStream?.getAudioTracks()[0]?.getSettings() ?? null,
     },
   }).catch(() => {});
 }

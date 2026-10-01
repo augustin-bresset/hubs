@@ -17,6 +17,9 @@ const CERT_DIR = path.join(ROOT, '.cert');
 const HTTP_PORT = Number(process.env.HTTP_PORT ?? 8080);
 const HTTPS_PORT = Number(process.env.HTTPS_PORT ?? 8443);
 const MAX_UPLOAD = 80 * 1024 * 1024;
+// Enregistrements du micro envoyés par l'appareil qui écoute, pour analyse hors ligne.
+const CAPTURE_DIR = process.env.CAPTURE_DIR ?? path.join(ROOT, 'captures');
+const CAPTURE_KEEP = 12;
 
 const PLAY_LEAD_MS = 1500; // délai entre « lecture » et le premier son : doit couvrir la plus grosse latence
 const CALIB_LEAD_MS = 2000;
@@ -247,6 +250,21 @@ async function handle(req, res) {
     broadcast('track', trackInfo());
     setPlayback({ track: track.id, playing: false, P0: 0 });
     return json(res, 200, { ok: true, track: trackInfo() });
+  }
+
+  if (p === '/api/capture' && req.method === 'POST') {
+    const data = await readBody(req, 16 * 1024 * 1024);
+    const meta = JSON.parse(decodeURIComponent(req.headers['x-meta'] ?? '%7B%7D'));
+    fs.mkdirSync(CAPTURE_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.writeFileSync(path.join(CAPTURE_DIR, `${stamp}.f32`), data);
+    fs.writeFileSync(path.join(CAPTURE_DIR, `${stamp}.json`), JSON.stringify({ ...meta, track: trackInfo() }, null, 1));
+    const old = fs.readdirSync(CAPTURE_DIR).filter((f) => f.endsWith('.f32')).sort().slice(0, -CAPTURE_KEEP);
+    for (const f of old) {
+      fs.rmSync(path.join(CAPTURE_DIR, f));
+      fs.rmSync(path.join(CAPTURE_DIR, f.replace(/\.f32$/, '.json')), { force: true });
+    }
+    return json(res, 200, { ok: true });
   }
 
   if (p.startsWith('/api/track/')) {

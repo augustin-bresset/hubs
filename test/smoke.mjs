@@ -2,17 +2,21 @@
 // lisent le métronome, puis la page A se calibre via une boucle interne de 123 ms.
 // Ne valide pas l'acoustique réelle, seulement la chaîne horloges -> programmation -> mesure.
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import puppeteer from 'puppeteer-core';
 
 const HTTP_PORT = 18080, HTTPS_PORT = 18443;
+const CAPTURE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-captures-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Clic déclenché dans la page : le clic « souris » de puppeteer attend un rendu qui n'arrive jamais dans un onglet en arrière-plan.
 const click = (page, selector) => page.$eval(selector, (el) => el.click());
 
 const server = spawn(process.execPath, ['server.mjs'], {
   cwd: new URL('..', import.meta.url).pathname,
-  env: { ...process.env, HTTP_PORT, HTTPS_PORT },
+  env: { ...process.env, HTTP_PORT, HTTPS_PORT, CAPTURE_DIR },
 });
 await new Promise((resolve, reject) => {
   server.stdout.on('data', (d) => String(d).includes('prêt') && resolve());
@@ -126,9 +130,13 @@ try {
   sa = await state(a); sb = await state(b);
   assert.ok(!sa.sig && !sb.sig, 'signatures arrêtées avec le suivi');
 
+  const captures = fs.readdirSync(CAPTURE_DIR);
+  assert.ok(captures.some((f) => f.endsWith('.f32')) && captures.some((f) => f.endsWith('.json')), 'enregistrement du micro reçu par le serveur');
+
   assert.deepEqual(errors, [], 'aucune erreur JavaScript');
   console.log('OK');
 } finally {
   await browser.close();
   server.kill();
+  fs.rmSync(CAPTURE_DIR, { recursive: true, force: true });
 }
