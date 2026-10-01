@@ -70,8 +70,8 @@ sur son enceinte). Sources possibles :
 - **Entrée audio** : carte son, table de mixage, micro. Attention au micro intégré : il capte la
   pièce, donc aussi les enceintes.
 - **Câble virtuel**, pour une application ou un logiciel de mix. Sous Linux :
-  `tools/linux-virtual-input.sh on`, puis diriger l'application vers la sortie « Behind-cable » et
-  choisir l'entrée « Behind-source » comme source du direct (`off` pour le retirer). Sous Windows et
+  `tools/linux-virtual-input.sh on`, puis diriger l'application vers la sortie « Cable-direct » et
+  choisir l'entrée « Source-direct » comme source du direct (`off` pour le retirer). Sous Windows et
   macOS, des outils comme VB-Cable ou BlackHole jouent le même rôle.
 
 Le retard (1 s par défaut) sépare la capture de l'écoute : il doit dépasser la plus grande
