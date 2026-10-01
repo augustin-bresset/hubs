@@ -28,7 +28,9 @@ await new Promise((resolve, reject) => {
 
 // BROWSER=firefox rejoue le même scénario sous Firefox, dont le moteur audio diffère de celui de Chrome.
 const FIREFOX = process.env.BROWSER === 'firefox';
-const TRACK_TOLERANCE_MS = FIREFOX ? 2.5 : 1; // sous Firefox la position de lecture flotte d'environ ±1 ms
+// Une mesure de suivi varie d'environ ±1 ms d'une fenêtre à l'autre (la position de lecture flotte,
+// un peu plus sous Firefox) : la tolérance laisse de la marge au-dessus de cette dispersion.
+const TRACK_TOLERANCE_MS = FIREFOX ? 2.5 : 2;
 const browser = await puppeteer.launch(FIREFOX ? {
   product: 'firefox',
   protocol: 'webDriverBiDi',
