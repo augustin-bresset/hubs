@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Serveur de la bêta Unisson : fichiers statiques, horloge de référence et relais
+// Serveur Unisson : fichiers statiques, horloge de référence, comptes, salles et relais
 // d'événements (SSE). Aucune dépendance : `node server.mjs`.
 import http from 'node:http';
 import https from 'node:https';
@@ -10,21 +10,20 @@ import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { createAuth, isLoopback } from './server/auth.mjs';
+import { createRooms } from './server/rooms.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
 const CERT_DIR = path.join(ROOT, '.cert');
 const HTTP_PORT = Number(process.env.HTTP_PORT ?? 8080);
 const HTTPS_PORT = Number(process.env.HTTPS_PORT ?? 8443);
-const MAX_UPLOAD = 80 * 1024 * 1024;
+// Adresse publique du service : c'est là que Google renvoie après la connexion.
+const PUBLIC_URL = (process.env.PUBLIC_URL ?? `http://localhost:${HTTP_PORT}`).replace(/\/$/, '');
+const DATA_DIR = process.env.DATA_DIR ?? path.join(ROOT, 'data');
 // Enregistrements du micro envoyés par l'appareil qui écoute, pour analyse hors ligne.
 const CAPTURE_DIR = process.env.CAPTURE_DIR ?? path.join(ROOT, 'captures');
-const CAPTURE_KEEP = 12;
-
-const PLAY_LEAD_MS = 1500; // délai entre « lecture » et le premier son : doit couvrir la plus grosse latence
-const CALIB_LEAD_MS = 2000;
-const CALIB_SLOT_MS = 1300; // un chirp par créneau, les appareils émettent chacun leur tour
-const CALIB_REPS = 3;
+const MAX_UPLOAD = 80 * 1024 * 1024;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -32,140 +31,14 @@ const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
 };
+// Tout le code vient du serveur lui-même ; les images distantes servent aux photos de profil.
+const CSP = "default-src 'self'; img-src 'self' https: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 const now = () => performance.now();
 const BOOT = randomUUID(); // l'horloge repart de zéro à chaque démarrage : les pages doivent le savoir
 
-// --- État partagé -----------------------------------------------------------
-
-const clients = new Map(); // id -> { id, name, ready, status, res }
-const history = []; // résultats de calibration, du plus ancien au plus récent
-const SLOTS = 4; // emplacements de suivi : un par bande de fréquences réservée (voir PROBE.bands)
-// Suivi continu : chaque appareil a sa bande réservée dans la musique, celui qui écoute y mesure son retard.
-let tracking = { on: false, listener: null };
-let track = null; // dernier fichier envoyé : { id, name, type, data }
-// Position P0 (s) de la piste à l'instant serveur S0 (ms).
-let playback = { track: 'metronome', playing: false, S0: 0, P0: 0 };
-
-function send(res, event, data) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
-function broadcast(event, data) {
-  for (const c of clients.values()) send(c.res, event, data);
-}
-const clientList = () => [...clients.values()].map(({ id, name, ready, status, slot }) => ({ id, name, ready, status, slot }));
-const trackInfo = () => track && { id: track.id, name: track.name };
-
-let clientsTimer = null;
-function broadcastClients() {
-  if (clientsTimer) return;
-  clientsTimer = setTimeout(() => {
-    clientsTimer = null;
-    broadcast('clients', clientList());
-  }, 200);
-}
-
-function setPlayback(patch) {
-  playback = { ...playback, ...patch };
-  broadcast('playback', playback);
-}
-const currentPos = () => (playback.playing ? playback.P0 + (now() - playback.S0) / 1000 : playback.P0);
-
-function startCalib(msg) {
-  const emitters = [...clients.values()].filter((c) => c.ready);
-  if (!clients.get(msg.id)?.ready) return { ok: false, error: "l'appareil qui écoute n'a pas rejoint" };
-  if (tracking.on) return { ok: false, error: 'arrête le suivi continu avant de calibrer' };
-  if (playback.playing) setPlayback({ playing: false, P0: currentPos() });
-  const schedule = [];
-  let T = now() + CALIB_LEAD_MS;
-  for (let rep = 0; rep < CALIB_REPS; rep++) {
-    for (const c of emitters) {
-      schedule.push({ client: c.id, name: c.name, T });
-      T += CALIB_SLOT_MS;
-    }
-  }
-  const calibId = randomUUID();
-  const mode = ['measure', 'verify', 'probe'].includes(msg.mode) ? msg.mode : 'measure';
-  broadcast('calib', { calibId, listener: msg.id, mode, schedule, end: T });
-  return { ok: true, calibId };
-}
-
-// Garde et journalise chaque mesure, avec la compensation en vigueur au moment où elle arrive.
-function recordCalib(result) {
-  const entry = {
-    ...result,
-    at: Date.now(),
-    results: result.results.map((r) => ({ ...r, compMs: clients.get(r.client)?.status?.latencyMs ?? null })),
-  };
-  history.push(entry);
-  if (history.length > 500) history.shift();
-  const fmt = (v) => (v == null ? '–' : v.toFixed(1));
-  const signed = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}`;
-  const nameOf = (id) => entry.results.find((r) => r.client === id)?.name ?? id;
-  const parts = entry.results.map((r) => {
-    const value = r.detected ? `${fmt(r.ms)}ms` : 'non détecté';
-    const detail = entry.mode === 'track'
-      ? `score ${fmt(r.psr)}, niveau ${r.levelDb == null ? '–' : `${Math.round(r.levelDb)} dB`}${r.windows > 1 ? `, cumul ${r.windows}` : ''}`
-      : `dispersion ${fmt(r.spreadMs)}, ${r.hits}/${r.reps}, score ${Math.round(Math.min(r.psr, 999))}`;
-    return `${r.name}=${value} (${detail}, comp ${fmt(r.compMs)})`;
-  });
-  const fixes = entry.mode === 'track' && entry.corrections.length
-    ? `  corrections : ${entry.corrections.map((c) => `${nameOf(c.client)} ${signed(c.deltaMs)}ms`).join(', ')}`
-    : '';
-  console.log(`[${new Date(entry.at).toLocaleTimeString('fr-FR')}] ${entry.mode.padEnd(7)} ${parts.join('  ')}${fixes}`);
-  broadcast('calibResult', entry);
-}
-
-function setTracking(msg) {
-  if (msg.on === true) {
-    if (!clients.get(msg.id)?.ready) return { ok: false, error: "l'appareil qui écoute n'a pas rejoint" };
-    tracking = { on: true, listener: msg.id };
-  } else {
-    tracking = { on: false, listener: null };
-  }
-  console.log(`[${new Date().toLocaleTimeString('fr-FR')}] suivi ${tracking.on ? 'actif' : 'arrêté'}`);
-  broadcast('tracking', tracking);
-  return { ok: true };
-}
-
-function handleCmd(msg) {
-  switch (msg.type) {
-    case 'status': {
-      const c = clients.get(msg.id);
-      if (!c) return { ok: false, error: 'client inconnu' };
-      if (typeof msg.name === 'string') c.name = msg.name.slice(0, 40);
-      c.ready = !!msg.ready;
-      c.status = msg.status ?? null;
-      broadcastClients();
-      return { ok: true };
-    }
-    case 'play':
-      if (!playback.playing) setPlayback({ playing: true, S0: now() + PLAY_LEAD_MS });
-      return { ok: true };
-    case 'pause':
-      if (playback.playing) setPlayback({ playing: false, P0: currentPos() });
-      return { ok: true };
-    case 'stop':
-      setPlayback({ playing: false, P0: 0 });
-      return { ok: true };
-    case 'track':
-      if (msg.track !== 'metronome' && msg.track !== track?.id) return { ok: false, error: 'piste inconnue' };
-      setPlayback({ track: msg.track, playing: false, P0: 0 });
-      return { ok: true };
-    case 'setLatency':
-      broadcast('setLatency', { target: msg.target, deltaMs: Number(msg.deltaMs) || 0 });
-      return { ok: true };
-    case 'calib':
-      return startCalib(msg);
-    case 'calibResult':
-      recordCalib(msg.result);
-      return { ok: true };
-    case 'tracking':
-      return setTracking(msg);
-    default:
-      return { ok: false, error: 'commande inconnue' };
-  }
-}
+const auth = createAuth({ dataDir: DATA_DIR, publicUrl: PUBLIC_URL });
+const rooms = createRooms({ dataDir: DATA_DIR, now, captureDir: CAPTURE_DIR });
 
 // --- HTTP -------------------------------------------------------------------
 
@@ -185,19 +58,85 @@ function readBody(req, limit) {
   });
 }
 
+const readJson = async (req) => JSON.parse((await readBody(req, 1024 * 1024)).toString('utf8') || '{}');
+
 function json(res, code, data) {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(data));
 }
 
-function serveStatic(res, pathname) {
-  const file = path.normalize(path.join(PUBLIC, pathname === '/' ? 'index.html' : pathname));
-  if (!file.startsWith(PUBLIC + path.sep)) return json(res, 403, { ok: false });
+function serveFile(res, file) {
   fs.readFile(file, (err, data) => {
     if (err) return json(res, 404, { ok: false, error: 'introuvable' });
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] ?? 'application/octet-stream', 'Cache-Control': 'no-store' });
+    res.writeHead(200, {
+      'Content-Type': MIME[path.extname(file)] ?? 'application/octet-stream',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'same-origin',
+      'Content-Security-Policy': CSP,
+    });
     res.end(data);
   });
+}
+
+function serveStatic(res, pathname) {
+  const file = path.normalize(path.join(PUBLIC, pathname));
+  if (!file.startsWith(PUBLIC + path.sep)) return json(res, 403, { ok: false });
+  serveFile(res, file);
+}
+
+// Une action faite avec le cookie de session doit venir de nos propres pages.
+function sameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+async function handleRoom(req, res, url, code, rest) {
+  const meta = rooms.meta(code);
+  if (!meta) return json(res, 404, { ok: false, error: 'salle introuvable' });
+  const user = auth.currentUser(req);
+  const isOwner = user?.id === meta.ownerId;
+
+  if (rest === '' && req.method === 'GET') return json(res, 200, { ok: true, code: meta.code, name: meta.name, ownerName: meta.ownerName, isOwner });
+  if (rest === '' && req.method === 'DELETE') {
+    if (!isOwner || !sameOrigin(req)) return json(res, 403, { ok: false, error: 'réservé au créateur de la salle' });
+    rooms.remove(code);
+    return json(res, 200, { ok: true });
+  }
+
+  const room = rooms.open(code);
+  if (rest === '/events') {
+    const id = url.searchParams.get('id');
+    if (!id) return json(res, 400, { ok: false });
+    return room.connect(req, res, id.slice(0, 40), (url.searchParams.get('name') || 'Appareil').slice(0, 40));
+  }
+  if (rest === '/cmd' && req.method === 'POST') return json(res, 200, room.handleCmd(await readJson(req)));
+
+  if (rest === '/track' && req.method === 'POST') {
+    // Le morceau est gardé en mémoire sur le serveur : seul le créateur de la salle peut en envoyer un.
+    if (!isOwner || !sameOrigin(req)) return json(res, 403, { ok: false, error: 'seul le créateur de la salle peut envoyer un morceau' });
+    const data = await readBody(req, MAX_UPLOAD);
+    return json(res, 200, { ok: true, track: room.setTrack(url.searchParams.get('name') || 'fichier', req.headers['content-type'] || 'application/octet-stream', data) });
+  }
+  if (rest.startsWith('/track/') && req.method === 'GET') {
+    const track = room.track;
+    if (!track || rest.slice('/track/'.length) !== track.id) return json(res, 404, { ok: false });
+    res.writeHead(200, { 'Content-Type': track.type, 'Content-Length': track.data.length, 'Cache-Control': 'no-store' });
+    return res.end(track.data);
+  }
+  if (rest === '/capture' && req.method === 'POST') {
+    // Écrit sur le disque du serveur : réservé à la machine qui l'héberge.
+    if (!isLoopback(req)) return json(res, 403, { ok: false });
+    const data = await readBody(req, 16 * 1024 * 1024);
+    room.saveCapture(JSON.parse(decodeURIComponent(req.headers['x-meta'] ?? '%7B%7D')), data);
+    return json(res, 200, { ok: true });
+  }
+  return json(res, 404, { ok: false });
 }
 
 async function handle(req, res) {
@@ -208,77 +147,28 @@ async function handle(req, res) {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store', 'X-Boot': BOOT });
     return res.end(String(now()));
   }
-
   if (p === '/api/info') return json(res, 200, { urls: lanAddresses().map((ip) => `https://${ip}:${HTTPS_PORT}`) });
 
-  if (p === '/api/events') {
-    const id = url.searchParams.get('id');
-    if (!id) return json(res, 400, { ok: false });
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
-    const old = clients.get(id);
-    old?.res.end();
-    const name = (url.searchParams.get('name') || 'Appareil').slice(0, 40);
-    // Premier emplacement libre ; au-delà de SLOTS appareils, les suivants ne sont pas suivis.
-    const taken = new Set([...clients.values()].filter((c) => c.id !== id).map((c) => c.slot));
-    const free = Array.from({ length: SLOTS }, (_, i) => i).find((i) => !taken.has(i)) ?? null;
-    const client = { ready: false, status: null, slot: free, ...old, id, name, res };
-    clients.set(id, client);
-    send(res, 'hello', { clients: clientList(), track: trackInfo(), playback, history, tracking });
-    broadcastClients();
-    req.on('close', () => {
-      if (clients.get(id)?.res === res) {
-        clients.delete(id);
-        broadcastClients();
-        if (tracking.listener === id) setTracking({ on: false }); // plus personne n'écoute
-      }
-    });
-    return;
-  }
+  if (await auth.handle(req, res, url, { json, readJson })) return;
 
-  if (p === '/api/cmd' && req.method === 'POST') {
-    const body = await readBody(req, 1024 * 1024);
-    return json(res, 200, handleCmd(JSON.parse(body.toString('utf8'))));
-  }
-
-  if (p === '/api/track' && req.method === 'POST') {
-    const data = await readBody(req, MAX_UPLOAD);
-    track = {
-      id: randomUUID(),
-      name: (url.searchParams.get('name') || 'fichier').slice(0, 120),
-      type: req.headers['content-type'] || 'application/octet-stream',
-      data,
-    };
-    broadcast('track', trackInfo());
-    setPlayback({ track: track.id, playing: false, P0: 0 });
-    return json(res, 200, { ok: true, track: trackInfo() });
-  }
-
-  if (p === '/api/capture' && req.method === 'POST') {
-    const data = await readBody(req, 16 * 1024 * 1024);
-    const meta = JSON.parse(decodeURIComponent(req.headers['x-meta'] ?? '%7B%7D'));
-    fs.mkdirSync(CAPTURE_DIR, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    fs.writeFileSync(path.join(CAPTURE_DIR, `${stamp}.f32`), data);
-    fs.writeFileSync(path.join(CAPTURE_DIR, `${stamp}.json`), JSON.stringify({ ...meta, track: trackInfo() }, null, 1));
-    // Le morceau joué, pour pouvoir refaire l'analyse hors ligne.
-    const trackFile = track && path.join(CAPTURE_DIR, `track-${track.id}`);
-    if (trackFile && meta.playback?.track === track.id && !fs.existsSync(trackFile)) fs.writeFileSync(trackFile, track.data);
-    const old = fs.readdirSync(CAPTURE_DIR).filter((f) => f.endsWith('.f32')).sort().slice(0, -CAPTURE_KEEP);
-    for (const f of old) {
-      fs.rmSync(path.join(CAPTURE_DIR, f));
-      fs.rmSync(path.join(CAPTURE_DIR, f.replace(/\.f32$/, '.json')), { force: true });
+  if (p === '/api/rooms') {
+    const user = auth.currentUser(req);
+    if (!user) return json(res, 401, { ok: false, error: 'connexion requise' });
+    if (req.method === 'GET') return json(res, 200, { ok: true, rooms: rooms.listFor(user.id).map(({ code, name, createdAt }) => ({ code, name, createdAt })) });
+    if (req.method === 'POST') {
+      if (!sameOrigin(req)) return json(res, 403, { ok: false });
+      const out = rooms.create(user, (await readJson(req)).name);
+      return out.error ? json(res, 409, { ok: false, error: out.error }) : json(res, 201, { ok: true, code: out.meta.code, name: out.meta.name });
     }
-    return json(res, 200, { ok: true });
+    return json(res, 405, { ok: false });
   }
+  const m = p.match(/^\/api\/rooms\/([A-Z0-9]{6})(\/.*)?$/);
+  if (m) return handleRoom(req, res, url, m[1], m[2] ?? '');
 
-  if (p.startsWith('/api/track/')) {
-    if (!track || p.slice('/api/track/'.length) !== track.id) return json(res, 404, { ok: false });
-    res.writeHead(200, { 'Content-Type': track.type, 'Content-Length': track.data.length, 'Cache-Control': 'no-store' });
-    return res.end(track.data);
-  }
-
-  if (req.method === 'GET') return serveStatic(res, p);
-  json(res, 405, { ok: false });
+  if (req.method !== 'GET') return json(res, 405, { ok: false });
+  if (p === '/') return serveFile(res, path.join(PUBLIC, 'home.html'));
+  if (/^\/r\/[A-Za-z0-9]{6}$/.test(p)) return serveFile(res, path.join(PUBLIC, 'room.html'));
+  return serveStatic(res, p);
 }
 
 function listener(req, res) {
@@ -318,15 +208,11 @@ function ensureCert() {
   return { key: fs.readFileSync(key), cert: fs.readFileSync(cert) };
 }
 
-// Ping SSE pour garder les connexions ouvertes.
-setInterval(() => {
-  for (const c of clients.values()) c.res.write(': ping\n\n');
-}, 15000).unref();
-
 http.createServer(listener).listen(HTTP_PORT, () => {
   https.createServer(ensureCert(), listener).listen(HTTPS_PORT, () => {
     console.log('Unisson prêt.');
     console.log(`  Sur cet ordinateur : http://localhost:${HTTP_PORT}`);
-    for (const ip of lanAddresses()) console.log(`  Sur le téléphone   : https://${ip}:${HTTPS_PORT}  (accepter l'avertissement de certificat)`);
+    for (const ip of lanAddresses()) console.log(`  Sur le réseau local : https://${ip}:${HTTPS_PORT}  (accepter l'avertissement de certificat)`);
+    console.log(auth.googleEnabled ? `  Connexion Google active, retour sur ${PUBLIC_URL}/auth/callback` : '  Connexion Google non configurée : connexion de développement, depuis cet ordinateur seulement.');
   });
 });

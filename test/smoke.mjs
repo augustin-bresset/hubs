@@ -11,13 +11,15 @@ import puppeteer from 'puppeteer-core';
 const HTTP_PORT = 18080, HTTPS_PORT = 18443;
 // KEEP_CAPTURES=dossier garde les enregistrements du micro, pour essayer tools/analyze-capture.mjs.
 const CAPTURE_DIR = process.env.KEEP_CAPTURES ?? fs.mkdtempSync(path.join(os.tmpdir(), 'sync-captures-'));
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-data-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Clic déclenché dans la page : le clic « souris » de puppeteer attend un rendu qui n'arrive jamais dans un onglet en arrière-plan.
 const click = (page, selector) => page.$eval(selector, (el) => el.click());
 
 const server = spawn(process.execPath, ['server.mjs'], {
   cwd: new URL('..', import.meta.url).pathname,
-  env: { ...process.env, HTTP_PORT, HTTPS_PORT, CAPTURE_DIR },
+  // Sans identifiants Google : la connexion de développement, ouverte depuis cette machine, sert au test.
+  env: { ...process.env, HTTP_PORT, HTTPS_PORT, CAPTURE_DIR, DATA_DIR, GOOGLE_CLIENT_ID: '', GOOGLE_CLIENT_SECRET: '' },
 });
 await new Promise((resolve, reject) => {
   server.stdout.on('data', (d) => String(d).includes('prêt') && resolve());
@@ -63,15 +65,40 @@ try {
     await page.goto(url);
     return page;
   };
+  // L'écart de lecture est relevé cinq fois : une lecture isolée peut tomber sur un à-coup passager
+  // (sous Firefox surtout), c'est la valeur médiane qui dit si la lecture est calée.
+  const state = async (page) => {
+    const errs = [];
+    for (let i = 0; i < 5; i++) {
+      errs.push(await page.evaluate(() => window.unisson.S.errMs));
+      await sleep(300);
+    }
+    const snapshot = await snapshotOf(page);
+    const valid = errs.filter((v) => v !== null).sort((p, q) => p - q);
+    return { ...snapshot, errMs: valid.length ? valid[valid.length >> 1] : null };
+  };
   // Passage par du JSON : le pilotage de Firefox tronque les objets imbriqués.
-  const state = async (page) => JSON.parse(await page.evaluate(() => {
+  const snapshotOf = async (page) => JSON.parse(await page.evaluate(() => {
     const { S } = window.unisson;
     return JSON.stringify({ id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing, tracks: S.history.filter((h) => h.mode === 'track'), notch: S.notchKey, wait: S.trackWait });
   }));
 
-  const a = await open(`http://localhost:${HTTP_PORT}/?loopback`);
+  // A se connecte depuis l'accueil et crée une salle, comme le ferait l'hôte.
+  const a = await open(`http://localhost:${HTTP_PORT}/`);
+  const code = await a.evaluate(async () => {
+    const send = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json());
+    await send('/auth/dev', { name: 'Hôte' });
+    return (await send('/api/rooms', { name: 'Salle de test' })).code;
+  });
+  assert.match(code ?? '', /^[A-Z2-9]{6}$/, 'salle créée après connexion');
+  await a.goto(`http://localhost:${HTTP_PORT}/r/${code}?loopback`);
   // Sous Chrome, B passe par le chemin HTTPS (certificat auto-signé accepté par option).
-  const b = await open(FIREFOX ? `http://localhost:${HTTP_PORT}/` : `https://localhost:${HTTPS_PORT}/`);
+  // B est un invité : autre nom d'hôte, donc pas le cookie de session de A (les cookies ignorent le port).
+  const b = await open(FIREFOX ? `http://127.0.0.1:${HTTP_PORT}/r/${code}` : `https://127.0.0.1:${HTTPS_PORT}/r/${code}`);
+  await sleep(500);
+  const uploadHidden = (page) => page.$eval('#fileLabel', (el) => el.hidden);
+  assert.equal(await uploadHidden(a), false, "l'hôte peut envoyer un morceau");
+  assert.equal(await uploadHidden(b), true, "un invité ne le peut pas");
   await click(a, '#join');
   await sleep(2500);
   await click(a, '#play');
@@ -142,7 +169,8 @@ try {
     v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
     let seed = 1;
     for (let i = 0; i < n; i++) { seed = (seed * 1664525 + 1013904223) >>> 0; v.setInt16(44 + i * 2, (seed / 2 ** 32 - 0.5) * 16000, true); }
-    await fetch('/api/track?name=bruit.wav', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: buf });
+    const sent = await fetch(`/api/rooms/${location.pathname.split('/')[2]}/track?name=bruit.wav`, { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: buf });
+    if (!sent.ok) throw new Error(`envoi refusé (${sent.status})`);
   });
   await sleep(500);
   await click(a, '#tracking');
@@ -168,7 +196,7 @@ try {
   sa = await state(a); sb = await state(b);
   assert.ok(sa.notch === '' && sb.notch === '', 'filtres retirés avec le suivi');
 
-  const captures = fs.readdirSync(CAPTURE_DIR);
+  const captures = fs.readdirSync(path.join(CAPTURE_DIR, code));
   assert.ok(captures.some((f) => f.endsWith('.f32')) && captures.some((f) => f.endsWith('.json')), 'enregistrement du micro reçu par le serveur');
 
   assert.deepEqual(errors, [], 'aucune erreur JavaScript');
@@ -177,4 +205,5 @@ try {
   await browser.close();
   server.kill();
   if (!process.env.KEEP_CAPTURES) fs.rmSync(CAPTURE_DIR, { recursive: true, force: true });
+  fs.rmSync(DATA_DIR, { recursive: true, force: true });
 }

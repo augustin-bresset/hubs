@@ -24,6 +24,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 const isLocal = ['localhost', '127.0.0.1'].includes(location.hostname);
+// Chaque salle a son adresse (/r/CODE) et ses propres appareils, lecture et suivi.
+const ROOM = (location.pathname.split('/')[2] ?? '').toUpperCase();
+const API = `/api/rooms/${ROOM}`;
 
 const S = {
   id: sessionStorage.getItem('unisson.id') || Math.random().toString(36).slice(2, 10),
@@ -78,7 +81,7 @@ function log(...parts) {
 }
 
 async function cmd(type, extra = {}) {
-  const r = await fetch('/api/cmd', {
+  const r = await fetch(`${API}/cmd`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ type, id: S.id, ...extra }),
@@ -167,7 +170,7 @@ function getBuffer(trackId) {
   if (S.loading?.id !== trackId) {
     const promise = (async () => {
       log('chargement de la piste…');
-      const r = await fetch(`/api/track/${trackId}`);
+      const r = await fetch(`${API}/track/${trackId}`);
       if (!r.ok) throw new Error('piste introuvable sur le serveur');
       const buf = await S.ctx.decodeAudioData(await r.arrayBuffer());
       S.buffers.set(trackId, buf);
@@ -296,7 +299,7 @@ function setLatency(ms, source) {
 async function ensureRecorder() {
   if (S.recorder) return;
   const ctx = S.ctx;
-  await ctx.audioWorklet.addModule('recorder-worklet.js');
+  await ctx.audioWorklet.addModule('/recorder-worklet.js');
   const node = new AudioWorkletNode(ctx, 'recorder');
   const mute = ctx.createGain();
   mute.gain.value = 0;
@@ -571,7 +574,7 @@ async function uploadCapture(result) {
     mic: S.micStream?.getAudioTracks()[0]?.getSettings() ?? null,
     userAgent: navigator.userAgent,
   };
-  await fetch('/api/capture', { method: 'POST', headers: { 'X-Meta': encodeURIComponent(JSON.stringify(meta)) }, body: data });
+  await fetch(`${API}/capture`, { method: 'POST', headers: { 'X-Meta': encodeURIComponent(JSON.stringify(meta)) }, body: data });
 }
 
 // Mesure le retard de chaque appareil sur une fenêtre de musique qui commence au plus tôt à
@@ -677,7 +680,7 @@ function reportStatus() {
 }
 
 function connectEvents() {
-  const es = new EventSource(`/api/events?id=${S.id}&name=${encodeURIComponent(S.name)}`);
+  const es = new EventSource(`${API}/events?id=${S.id}&name=${encodeURIComponent(S.name)}`);
   const on = (name, fn) => es.addEventListener(name, (e) => fn(JSON.parse(e.data)));
   const onPlayback = (d) => {
     // Une reconnexion renvoie l'état courant : inutile de couper le son s'il n'a pas changé.
@@ -979,25 +982,40 @@ $('file').onchange = async (e) => {
   const f = e.target.files[0];
   if (!f) return;
   log(`envoi de ${f.name}…`);
-  const r = await fetch(`/api/track?name=${encodeURIComponent(f.name)}`, {
+  const r = await fetch(`${API}/track?name=${encodeURIComponent(f.name)}`, {
     method: 'POST',
     headers: { 'Content-Type': f.type || 'application/octet-stream' },
     body: f,
   });
-  if (!r.ok) log("échec de l'envoi (fichier trop gros ?)");
+  if (!r.ok) log(`échec de l'envoi : ${(await r.json().catch(() => ({}))).error ?? 'fichier trop gros ?'}`);
   e.target.value = '';
 };
 
-if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-  fetch('/api/info').then((r) => r.json()).then(({ urls }) => {
-    if (urls.length) $('phoneUrl').textContent = `Sur le téléphone (même Wi-Fi) : ${urls.join(' ou ')} — accepter l'avertissement de certificat.`;
-  }).catch(() => {});
-}
+async function start() {
+  const meta = await fetch(API).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  if (!meta) {
+    $('joinCard').hidden = true;
+    $('missingCard').hidden = false;
+    $('net').textContent = 'salle introuvable';
+    return;
+  }
+  $('roomName').textContent = meta.name;
+  document.title = `${meta.name} — Unisson`;
+  $('fileLabel').hidden = !meta.isOwner; // le morceau est stocké sur le serveur : seul le créateur en envoie
 
-clockLoop();
-connectEvents();
-setInterval(render, 500);
-render();
+  // Lien à ouvrir sur les autres appareils. Depuis localhost, c'est l'adresse du réseau local qu'il faut donner.
+  const link = (origin) => `${origin}/r/${ROOM}`;
+  const lan = isLocal ? await fetch('/api/info').then((r) => r.json()).then((d) => d.urls).catch(() => []) : [];
+  $('phoneUrl').textContent = lan.length
+    ? `Sur les autres appareils (même Wi-Fi) : ${lan.map(link).join(' ou ')} — accepter l'avertissement de certificat.`
+    : `Lien de la salle, à ouvrir sur chaque appareil : ${link(location.origin)}`;
+
+  clockLoop();
+  connectEvents();
+  setInterval(render, 500);
+  render();
+}
+start();
 
 // Pour les tests et le débogage depuis la console.
 window.unisson = { S, serverNow };

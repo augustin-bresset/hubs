@@ -5,11 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Unisson — bêta</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header>
-    <h1>Unisson <small>bêta</small></h1>
+    <h1><a href="/">Unisson</a> <small id="roomName">salle</small></h1>
     <span id="net" class="pill">connexion…</span>
   </header>
 
@@ -24,11 +24,16 @@
       <p class="hint" id="phoneUrl"></p>
     </section>
 
+    <section class="card" id="missingCard" hidden>
+      <h2>Salle introuvable</h2>
+      <p class="hint">Ce lien ne correspond à aucune salle : elle a peut-être été supprimée. <a href="/">Retour à l'accueil</a></p>
+    </section>
+
     <section class="card" id="playCard" hidden>
       <h2>Lecture</h2>
       <div class="row">
         <select id="source"></select>
-        <label class="filebtn">Envoyer un fichier<input id="file" type="file" accept="audio/*" hidden></label>
+        <label class="filebtn" id="fileLabel" hidden>Envoyer un fichier<input id="file" type="file" accept="audio/*" hidden></label>
       </div>
       <div class="row">
         <button id="play" class="primary">Lecture</button>
@@ -80,6 +85,6 @@
     </section>
   </main>
 
-  <script type="module" src="app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

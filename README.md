@@ -11,15 +11,38 @@ C'est un prototype web : un petit serveur sur l'ordinateur, une page ouverte sur
 node server.mjs
 ```
 
-- Sur l'ordinateur : <http://localhost:8080>
-- Sur le téléphone (même Wi-Fi) : l'adresse `https://…:8443` affichée au démarrage. Le certificat est
-  auto-signé : accepter l'avertissement (le navigateur n'autorise le micro qu'en HTTPS).
+- Sur l'ordinateur : <http://localhost:8080>. Se connecter, créer une salle, l'ouvrir.
+- Sur les autres appareils (même Wi-Fi) : le lien `https://…:8443/r/CODE` affiché dans la salle. Le
+  certificat est auto-signé : accepter l'avertissement (le navigateur n'autorise le micro qu'en HTTPS).
 
 Aucune dépendance pour le serveur (Node 18+, `openssl` pour générer le certificat).
 
+## Comptes et salles
+
+- **Salle** : une adresse `/r/CODE` avec ses propres appareils, sa lecture et son suivi. On la rejoint
+  sans compte, avec le lien ou le code.
+- **Compte** : nécessaire pour créer une salle (10 au plus) et y envoyer un morceau. Connexion par
+  Google (OpenID Connect, flux « code » avec PKCE) ; la session tient dans un cookie signé.
+- Sans identifiants Google, une **connexion de développement** sans mot de passe est proposée, depuis
+  la machine qui héberge le serveur seulement.
+
+Configuration, par variables d'environnement :
+
+| Variable | Rôle |
+|---|---|
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Identifiants OAuth « application Web » créés dans la console Google Cloud, avec `PUBLIC_URL/auth/callback` comme URI de redirection autorisée. |
+| `PUBLIC_URL` | Adresse publique du service (défaut : `http://localhost:8080`). |
+| `SESSION_SECRET` | Clé de signature des sessions (sinon générée dans `data/`). |
+| `TRUST_PROXY=1` | Derrière un mandataire qui termine le HTTPS : cookies marqués `Secure`. |
+| `DATA_DIR` | Comptes, salles et clé de session (défaut : `data/`, hors git). |
+| `DEV_LOGIN=1` / `0` | Force ou interdit la connexion de développement. |
+
+Limites actuelles pour un vrai service : comptes et salles dans des fichiers JSON, morceaux gardés en
+mémoire (80 Mo par salle), pas de limitation de débit, un seul processus.
+
 ## Protocole de test
 
-1. Cliquer **Rejoindre** sur chaque appareil.
+1. Ouvrir la salle sur chaque appareil et cliquer **Rejoindre**.
 2. Choisir **Métronome** puis **Lecture** : sans calibration, on entend le décalage (écho entre les clics).
 3. Sur l'ordinateur, **Calibrer** : chaque appareil émet trois signaux brefs, le micro de l'ordinateur
    mesure la latence de chacun et la compensation est appliquée automatiquement.
@@ -76,7 +99,7 @@ du son (mode « appel », profil Bluetooth mains-libres) et fausser la mesure.
 ## Tests
 
 ```sh
-npm test               # traitement du signal (chirp, mesure par la musique) et modèle d'horloge
+npm test               # traitement du signal, modèle d'horloge, comptes et salles (faux fournisseur d'identité)
 npm install            # une fois, pour les tests suivants
 npm run smoke          # bout en bout dans Chrome sans écran : lecture, calibration, suivi en boucle interne
 npm run smoke:firefox  # le même scénario sous Firefox
@@ -85,5 +108,5 @@ npm run smoke:firefox  # le même scénario sous Firefox
 ## Diagnostic
 
 Pendant le suivi, l'appareil qui écoute envoie au serveur ce que son micro entend (s'il tourne sur la
-même machine). Les douze dernières fenêtres et le morceau joué sont gardés dans `captures/` ;
+même machine). Les douze dernières fenêtres et le morceau joué sont gardés dans `captures/CODE/` ;
 `node tools/analyze-capture.mjs` rejoue la mesure dessus (nécessite `ffmpeg`).

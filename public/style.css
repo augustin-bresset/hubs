@@ -24,6 +24,8 @@
 }
 
 * { box-sizing: border-box; }
+/* L'attribut hidden doit l'emporter sur les display posés plus bas (boutons, liens). */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--bg);
@@ -85,3 +87,23 @@ td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-num
 
 pre { margin: 8px 0 0; font-size: 12px; white-space: pre-wrap; max-height: 240px; overflow: auto; color: var(--muted); }
 summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+
+h1 a { color: inherit; text-decoration: none; }
+a { color: var(--accent); }
+a.button { text-decoration: none; }
+a.button, .button {
+  font: inherit;
+  font-size: 15px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 12px;
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+a.button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.device .nudge a.button { min-height: 36px; padding: 4px 10px; font-size: 13px; flex: 1; }
+.account { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.account button { min-height: 32px; padding: 4px 10px; font-size: 13px; }

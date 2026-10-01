@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unisson</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>Unisson <small>bêta</small></h1>
+    <span id="account" class="account"></span>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Rejoindre une salle</h2>
+      <form id="joinForm" class="row">
+        <input id="code" maxlength="6" autocomplete="off" autocapitalize="characters" placeholder="Code à 6 caractères" aria-label="Code de la salle">
+        <button class="primary">Rejoindre</button>
+      </form>
+      <p class="hint">Aucun compte n'est nécessaire pour rejoindre : le code ou le lien de la salle suffit.</p>
+    </section>
+
+    <section class="card" id="loginCard" hidden>
+      <h2>Créer une salle</h2>
+      <p class="hint">Un compte permet de créer des salles et d'y envoyer de la musique.</p>
+      <div class="row">
+        <a id="google" class="button primary" href="/auth/login" hidden>Se connecter avec Google</a>
+      </div>
+      <form id="devForm" class="row" hidden>
+        <input id="devName" maxlength="40" autocomplete="off" placeholder="Ton nom" aria-label="Nom">
+        <button>Connexion de développement</button>
+      </form>
+      <p class="hint" id="loginHint"></p>
+    </section>
+
+    <section class="card" id="roomsCard" hidden>
+      <h2>Mes salles</h2>
+      <div id="rooms"></div>
+      <form id="createForm" class="row">
+        <input id="roomName" maxlength="60" autocomplete="off" placeholder="Nom de la nouvelle salle" aria-label="Nom de la salle">
+        <button class="primary">Créer une salle</button>
+      </form>
+      <p class="hint" id="roomsHint"></p>
+    </section>
+  </main>
+
+  <script type="module" src="/home.js"></script>
+</body>
+</html>

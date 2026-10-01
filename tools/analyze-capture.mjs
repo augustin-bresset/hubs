@@ -1,13 +1,19 @@
 #!/usr/bin/env node
 // Rejoue hors ligne le suivi par la musique sur les enregistrements du micro (captures/*.f32 + .json),
 // avec le morceau sauvegardé à côté (track-<id>, décodé par ffmpeg).
-// Usage : node tools/analyze-capture.mjs [dossier]
+// Usage : node tools/analyze-capture.mjs [captures/<code de salle>]
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { PROBE, TRACKING, MusicAnalyzer, GapTracker } from '../public/dsp.js';
 
-const dir = process.argv[2] ?? new URL('../captures', import.meta.url).pathname;
+// Sans argument : la salle dont les captures sont les plus récentes (captures/<code de salle>/).
+function latestRoomDir() {
+  const base = new URL('../captures', import.meta.url).pathname;
+  const dirs = fs.readdirSync(base, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => path.join(base, d.name));
+  return dirs.sort((p, q) => fs.statSync(q).mtimeMs - fs.statSync(p).mtimeMs)[0] ?? base;
+}
+const dir = process.argv[2] ?? latestRoomDir();
 const BLOCKS = TRACKING.blocks;
 const music = new Map(); // « id@fréquence » -> échantillons mono
 let tracker = null;

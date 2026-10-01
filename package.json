@@ -6,7 +6,7 @@
   "description": "Bêta : lecture audio synchronisée sur plusieurs appareils, avec calibration au micro",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/dsp.test.mjs test/sync.test.mjs test/music.test.mjs",
+    "test": "node --test test/dsp.test.mjs test/sync.test.mjs test/music.test.mjs test/server.test.mjs",
     "smoke": "node test/smoke.mjs",
     "smoke:firefox": "BROWSER=firefox node test/smoke.mjs"
   },
