@@ -169,6 +169,45 @@ test('salles : création, droits du créateur, isolation, suppression', async ()
   assert.equal((await get(`/api/rooms/${b}`)).status, 200);
 });
 
+test('direct : réservé au créateur, relayé tel quel, avec rattrapage pour qui arrive', async () => {
+  const { session } = await login();
+  const code = (await (await post('/api/rooms', { name: 'Direct' }, session)).json()).code;
+  // L'hôte doit avoir rejoint la salle (flux d'événements ouvert et appareil prêt).
+  const events = await get(`/api/rooms/${code}/events?id=hote&name=Hôte`);
+  await post(`/api/rooms/${code}/cmd`, { type: 'status', id: 'hote', ready: true, status: {} });
+  const format = { id: 'hote', sampleRate: 48000, channels: 2, delayMs: 1000 };
+
+  assert.equal((await get(`/api/rooms/${code}/live/stream`)).status, 404, 'pas de flux sans direct');
+  assert.equal((await post(`/api/rooms/${code}/live/start`, format)).status, 403, 'un invité ne diffuse pas');
+  assert.equal((await (await post(`/api/rooms/${code}/live/start`, { ...format, channels: 7 }, session)).json()).ok, false);
+  const started = await (await post(`/api/rooms/${code}/live/start`, format, session)).json();
+  assert.deepEqual([started.ok, started.live.on, started.live.delayMs], [true, true, 1000]);
+  assert.equal((await (await post(`/api/rooms/${code}/cmd`, { type: 'play', id: 'hote' })).json()).ok, false, 'pas de lecture de fichier pendant un direct');
+  assert.equal((await (await post(`/api/rooms/${code}/cmd`, { type: 'calib', id: 'hote' })).json()).ok, false, 'ni de calibration');
+
+  const chunk = (k) => new Uint8Array(40).fill(k);
+  assert.equal((await post(`/api/rooms/${code}/live/chunk`, chunk(1), null, { 'Content-Type': 'application/octet-stream' })).status, 403);
+  for (const k of [1, 2]) await post(`/api/rooms/${code}/live/chunk`, chunk(k), session, { 'Content-Type': 'application/octet-stream' });
+
+  // Un appareil qui arrive reçoit d'abord les tranches récentes, puis les suivantes au fil de l'eau.
+  const stream = await get(`/api/rooms/${code}/live/stream`);
+  const reader = stream.body.getReader();
+  const received = [];
+  const readUntil = async (size) => { while (received.length < size) received.push(...(await reader.read()).value); };
+  await readUntil(80);
+  await post(`/api/rooms/${code}/live/chunk`, chunk(3), session, { 'Content-Type': 'application/octet-stream' });
+  await readUntil(120);
+  assert.deepEqual([received[0], received[40], received[80], received.length], [1, 2, 3, 120]);
+
+  // L'arrêt ferme les flux ; le départ de l'hôte arrête un direct en cours.
+  assert.equal((await (await post(`/api/rooms/${code}/live/stop`, {}, session)).json()).ok, true);
+  assert.equal((await reader.read()).done, true);
+  await post(`/api/rooms/${code}/live/start`, format, session);
+  await events.body.cancel();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal((await get(`/api/rooms/${code}/live/stream`)).status, 404, "plus de direct après le départ de l'hôte");
+});
+
 test('les pages sont servies avec une politique de sécurité de contenu', async () => {
   for (const url of ['/', '/r/ABC234']) {
     const res = await get(url);

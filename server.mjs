@@ -130,6 +130,18 @@ async function handleRoom(req, res, url, code, rest) {
     res.writeHead(200, { 'Content-Type': track.type, 'Content-Length': track.data.length, 'Cache-Control': 'no-store' });
     return res.end(track.data);
   }
+  // Direct : le son passe par le serveur, donc seul le créateur de la salle peut diffuser.
+  if (rest === '/live/stream' && req.method === 'GET') {
+    if (!room.live.on) return json(res, 404, { ok: false, error: 'aucun direct en cours' });
+    return room.listenLive(req, res);
+  }
+  if (rest.startsWith('/live/') && req.method === 'POST') {
+    if (!isOwner || !sameOrigin(req)) return json(res, 403, { ok: false, error: 'seul le créateur de la salle peut diffuser' });
+    if (rest === '/live/start') return json(res, 200, room.startLive(await readJson(req)));
+    if (rest === '/live/stop') return json(res, 200, room.stopLive());
+    if (rest === '/live/chunk') return json(res, 200, { ok: room.pushLive(await readBody(req, 1024 * 1024)) });
+  }
+
   if (rest === '/capture' && req.method === 'POST') {
     // Écrit sur le disque du serveur : réservé à la machine qui l'héberge.
     if (!isLoopback(req)) return json(res, 403, { ok: false });

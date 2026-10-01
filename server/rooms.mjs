@@ -12,6 +12,8 @@ const SLOTS = 4; // emplacements de suivi : un par bande de fréquences réserv�
 const CAPTURE_KEEP = 12;
 const ROOMS_PER_USER = 10;
 const IDLE_MS = 10 * 60 * 1000; // une salle vide depuis ce délai libère sa mémoire (morceau compris)
+const LIVE_BACKLOG = 30; // tranches rejouées à un appareil qui arrive en cours de direct (3 s)
+const LIVE_MAX_PENDING = 4 * 1024 * 1024; // un appareil qui prend ce retard de réception est décroché
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // sans 0/O ni 1/I/L, pour être dicté sans erreur
 
 function send(res, event, data) {
@@ -28,6 +30,10 @@ class Room {
     this.track = null; // dernier fichier envoyé : { id, name, type, data }
     // Position P0 (s) de la piste à l'instant serveur S0 (ms).
     this.playback = { track: 'metronome', playing: false, S0: 0, P0: 0 };
+    // Direct : l'hôte capte un son et l'envoie par tranches, relayées telles quelles aux appareils.
+    this.live = { on: false };
+    this.liveBacklog = [];
+    this.liveListeners = new Set();
     this.clientsTimer = null;
     this.emptySince = Date.now();
   }
@@ -66,7 +72,7 @@ class Room {
     const free = Array.from({ length: SLOTS }, (_, i) => i).find((i) => !taken.has(i)) ?? null;
     this.clients.set(id, { ready: false, status: null, slot: free, ...old, id, name, res });
     this.emptySince = null;
-    send(res, 'hello', { clients: this.clientList(), track: this.trackInfo(), playback: this.playback, history: this.history, tracking: this.tracking });
+    send(res, 'hello', { clients: this.clientList(), track: this.trackInfo(), playback: this.playback, history: this.history, tracking: this.tracking, live: this.live });
     this.broadcastClients();
     req.on('close', () => {
       if (this.clients.get(id)?.res !== res) return;
@@ -74,7 +80,55 @@ class Room {
       if (this.clients.size === 0) this.emptySince = Date.now();
       this.broadcastClients();
       if (this.tracking.listener === id) this.setTracking({ on: false }); // plus personne n'écoute
+      if (this.live.on && this.live.hostId === id) this.stopLive(); // plus personne ne diffuse
     });
+  }
+
+  // Démarre un direct. sampleRate et channels décrivent le son que l'hôte va envoyer ; delayMs est
+  // le retard entre la capture et l'écoute, commun à tous les appareils.
+  startLive({ id, sampleRate, channels, delayMs }) {
+    if (!this.clients.get(id)?.ready) return { ok: false, error: "l'appareil qui diffuse n'a pas rejoint" };
+    if (!(sampleRate >= 8000 && sampleRate <= 96000) || ![1, 2].includes(channels)) return { ok: false, error: 'format de son refusé' };
+    if (this.playback.playing) this.setPlayback({ playing: false, P0: this.currentPos() });
+    this.liveBacklog = [];
+    this.live = { on: true, id: crypto.randomUUID(), hostId: id, sampleRate, channels, delayMs: Math.max(300, Math.min(5000, Number(delayMs) || 1000)) };
+    this.log(`direct lancé par ${this.clients.get(id).name} (${sampleRate} Hz, ${channels} canal(aux), retard ${this.live.delayMs} ms)`);
+    this.broadcast('live', this.live);
+    return { ok: true, live: this.live };
+  }
+
+  stopLive() {
+    if (!this.live.on) return { ok: true };
+    this.live = { on: false };
+    this.liveBacklog = [];
+    for (const res of this.liveListeners) res.end();
+    this.liveListeners.clear();
+    this.log('direct arrêté');
+    this.broadcast('live', this.live);
+    return { ok: true };
+  }
+
+  // Relaie une tranche (déjà au format de public/live.js) à tous les appareils qui écoutent.
+  pushLive(frame) {
+    if (!this.live.on) return false;
+    this.liveBacklog.push(frame);
+    if (this.liveBacklog.length > LIVE_BACKLOG) this.liveBacklog.shift();
+    for (const res of this.liveListeners) {
+      if (res.writableLength > LIVE_MAX_PENDING) {
+        res.destroy();
+        this.liveListeners.delete(res);
+      } else res.write(frame);
+    }
+    return true;
+  }
+
+  // Ouvre le flux de son d'un appareil : d'abord les dernières tranches, puis le direct.
+  listenLive(req, res) {
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
+    res.socket?.setNoDelay(true);
+    for (const frame of this.liveBacklog) res.write(frame);
+    this.liveListeners.add(res);
+    req.on('close', () => this.liveListeners.delete(res));
   }
 
   setPlayback(patch) {
@@ -91,6 +145,7 @@ class Room {
     const emitters = [...this.clients.values()].filter((c) => c.ready);
     if (!this.clients.get(msg.id)?.ready) return { ok: false, error: "l'appareil qui écoute n'a pas rejoint" };
     if (this.tracking.on) return { ok: false, error: 'arrête le suivi continu avant de calibrer' };
+    if (this.live.on) return { ok: false, error: 'arrête le direct avant de calibrer' };
     if (this.playback.playing) this.setPlayback({ playing: false, P0: this.currentPos() });
     const schedule = [];
     let T = this.now() + CALIB_LEAD_MS;
@@ -156,6 +211,7 @@ class Room {
         return { ok: true };
       }
       case 'play':
+        if (this.live.on) return { ok: false, error: 'un direct est en cours' };
         if (!this.playback.playing) this.setPlayback({ playing: true, S0: this.now() + PLAY_LEAD_MS });
         return { ok: true };
       case 'pause':
@@ -208,6 +264,7 @@ class Room {
   }
 
   close() {
+    this.stopLive();
     for (const c of this.clients.values()) c.res.end();
     this.clients.clear();
   }
