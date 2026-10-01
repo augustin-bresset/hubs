@@ -526,11 +526,15 @@ function renderCalib() {
   const verify = res.mode === 'verify';
   const ok = res.results.filter((r) => r.detected);
   const gap = ok.length >= 2 ? Math.max(...ok.map((r) => r.ms)) - Math.min(...ok.map((r) => r.ms)) : null;
+  // Le trajet du micro ajoute à toutes les mesures un même décalage, qui dérive d'une mesure à
+  // l'autre : en vérification, seul l'écart par rapport à un appareil de référence a un sens.
+  const ref = verify ? ok.find((r) => r.client === res.listener) ?? ok[0] : null;
   const rows = res.results.map((r) => {
     const tr = document.createElement('tr');
+    const value = !r.detected ? 'non détecté' : !ref ? `${fmt(r.ms)} ms` : r === ref ? 'référence' : `${r.ms > ref.ms ? '+' : ''}${fmt(r.ms - ref.ms)} ms`;
     const cells = [
       r.name,
-      r.detected ? `${fmt(r.ms)} ms` : 'non détecté',
+      value,
       r.detected ? `${fmt(r.spreadMs)} ms` : '–',
       `${r.hits}/${r.reps}`,
       fmt(Math.min(r.psr, 999), 0),
@@ -543,12 +547,12 @@ function renderCalib() {
     });
     return tr;
   });
-  box.innerHTML = `<table><thead><tr><th>Appareil</th><th>${verify ? 'Écart résiduel' : 'Latence mesurée'}</th><th>Dispersion</th><th>Détections</th><th>Score</th></tr></thead><tbody></tbody></table><p class="hint"></p>`;
+  box.innerHTML = `<table><thead><tr><th>Appareil</th><th>${verify ? 'Écart après compensation' : 'Latence mesurée'}</th><th>Dispersion</th><th>Détections</th><th>Score</th></tr></thead><tbody></tbody></table><p class="hint"></p>`;
   box.querySelector('tbody').append(...rows);
   box.querySelector('.hint').textContent = verify
     ? gap == null
       ? 'Il faut au moins deux appareils détectés pour mesurer un écart.'
-      : `Écart entre appareils après compensation : ${fmt(gap)} ms (attendu : proche de 0).`
+      : `Écart entre appareils après compensation : ${fmt(gap)} ms (attendu : proche de 0).${Math.abs(ref.ms) > 5 ? ` Décalage commun de ${fmt(ref.ms, 0)} ms dû au trajet du micro, sans effet sur la synchro.` : ''}`
     : res.mode === 'probe'
       ? `Mesure seule, compensation inchangée${gap == null ? '' : ` (écart brut entre appareils : ${fmt(gap)} ms)`}.`
       : `Compensation appliquée aux appareils détectés${gap == null ? '' : ` (écart avant compensation : ${fmt(gap)} ms)`}. Lance « Vérifier » pour contrôler. La latence inclut celle du micro, identique pour tous.`;
@@ -566,7 +570,8 @@ function renderHistory() {
   $('historyBox').hidden = S.history.length === 0;
   const lines = S.history.map((h) => {
     const values = h.results.map((r) => `${r.name} ${r.detected ? `${fmt(r.ms)} ms` : 'non détecté'}`).join(' · ');
-    return `${new Date(h.at).toLocaleTimeString()}  ${MODE_LABEL[h.mode].padEnd(12)}  ${values}`;
+    const gap = gapOf(h);
+    return `${new Date(h.at).toLocaleTimeString()}  ${MODE_LABEL[h.mode].padEnd(12)}  ${values}${gap === null ? '' : `  →  écart ${fmt(gap)} ms`}`;
   });
   const text = lines.join('\n');
   if ($('history').textContent !== text) $('history').textContent = text;
