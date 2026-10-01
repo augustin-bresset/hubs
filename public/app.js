@@ -1,6 +1,7 @@
 import { makeChirp, detectChirp, median, PROBE, TRACKING, makeBandstop, MusicAnalyzer, GapTracker } from './dsp.js';
 import { fitClock, localToServer, serverToLocal, gapCorrections } from './sync.js';
 import { BRAND } from './brand.js';
+import { LIVE, encodeFrame, FrameParser, fitStreamClock, StreamRing } from './live.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -70,6 +71,10 @@ const S = {
   trackRunning: false,
   gapTracker: null, // mémoire du suivi d'une fenêtre à l'autre (appareils faibles)
   trackWait: '', // pourquoi le suivi ne mesure pas en ce moment
+  live: null, // direct en cours, diffusé par le serveur
+  hosting: null, // capture en cours, sur l'appareil qui diffuse
+  liveError: '',
+  isOwner: false,
   trackCenterMs: 0, // décalage commun (trajet du micro) autour duquel chercher les signatures
   lastTrack: null,
 };
@@ -260,9 +265,232 @@ class SyncedLoop {
   }
 }
 
+// Flux du direct asservi à l'horloge serveur : chaque échantillon doit être *entendu* `delayMs` après
+// sa capture par l'hôte. Même rôle que SyncedLoop, mais le son arrive par tranches et le rythme de
+// référence est celui de la carte son de l'hôte (voir fitStreamClock).
+class SyncedStream {
+  constructor(live) {
+    const ctx = S.ctx;
+    Object.assign(this, { live, sr: live.sampleRate, points: [], clock: null, report: null, err: null, started: false, lastResync: 0, lastTick: null, late: false });
+    this.integ = S.rateBias;
+    this.step = this.sr / ctx.sampleRate; // échantillons du flux par échantillon de sortie
+    this.ring = new StreamRing(this.sr);
+    this.node = new AudioWorkletNode(ctx, 'live-player', {
+      numberOfInputs: 0,
+      outputChannelCount: [2],
+      processorOptions: { capacity: Math.round(LIVE.ringSeconds * this.sr) },
+    });
+    this.node.port.onmessage = (e) => { this.report = e.data; };
+    this.node.connect(S.musicBus);
+  }
+
+  // Tranche reçue du serveur.
+  push({ n, t, channels, pcm }) {
+    const len = pcm.length / channels;
+    const left = new Float32Array(len), right = new Float32Array(len), mono = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      left[i] = pcm[i * channels] / 32768;
+      right[i] = channels === 2 ? pcm[i * 2 + 1] / 32768 : left[i];
+      mono[i] = (left[i] + right[i]) / 2;
+    }
+    this.ring.write(n, mono);
+    this.node.port.postMessage({ type: 'data', n, left, right }, [left.buffer, right.buffer]);
+    this.points.push({ n, t });
+    if (this.points.length > 300) this.points.shift();
+    this.clock = fitStreamClock(this.points, this.sr);
+  }
+
+  // Position du flux (en échantillons) entendue à une heure serveur donnée, et l'inverse.
+  posAt(heardMs) { return this.clock.posAt(heardMs - this.live.delayMs); }
+  msAt(pos) { return this.clock.msAt(pos) + this.live.delayMs; }
+
+  // Cale franchement la lecture : telle position du flux pour tel instant de l'horloge audio.
+  seek() {
+    const ctx = S.ctx;
+    const frame = Math.round((ctx.currentTime + 0.05) * ctx.sampleRate);
+    const heardMs = ctxToServer(frame / ctx.sampleRate + S.latencyMs / 1000 + S.notchDelay);
+    this.node.port.postMessage({ type: 'seek', pos: this.posAt(heardMs), frame });
+    Object.assign(this, { report: null, started: true, lastTick: null });
+  }
+
+  tick() {
+    if (!this.clock || this.points.length < 3) return;
+    if (!this.started) return this.seek();
+    const r = this.report, ctx = S.ctx;
+    if (!r) return;
+    const t = ctx.currentTime;
+    const actual = r.pos + (t - r.frame / ctx.sampleRate) * this.step * ctx.sampleRate;
+    const wanted = this.posAt(ctxToServer(t + S.latencyMs / 1000 + S.notchDelay));
+    const err = (actual - wanted) / this.sr;
+    this.err = err;
+    this.late = r.pos + 0.05 * this.sr > r.end; // le son n'arrive pas assez tôt : retard du direct trop court
+
+    if (Math.abs(err) > HARD_RESYNC_S) {
+      if (performance.now() - this.lastResync > 1000) {
+        this.lastResync = performance.now();
+        log(`recalage du direct (écart ${(err * 1000).toFixed(1)} ms)`);
+        this.seek();
+      }
+      return;
+    }
+    const dt = this.lastTick === null ? 0 : Math.min(2, t - this.lastTick);
+    this.lastTick = t;
+    if (Math.abs(err) < INTEG_FREEZE_S) {
+      this.integ = Math.max(-INTEG_MAX, Math.min(INTEG_MAX, this.integ + KI * err * dt));
+      S.rateBias = this.integ;
+    }
+    const factor = 1 - Math.max(-MAX_RATE_DEV, Math.min(MAX_RATE_DEV, KP * err + this.integ));
+    this.step = ((this.clock.rate * 1000) / ctx.sampleRate) * factor;
+    this.node.port.postMessage({ type: 'rate', value: this.step });
+  }
+
+  stop() {
+    this.node.disconnect();
+  }
+}
+
 function stopSource() {
   S.play?.stop();
   S.play = null;
+}
+
+// --- Direct -------------------------------------------------------------------
+
+// Applique l'état du direct diffusé par le serveur : pendant un direct, chaque appareil lit le flux.
+function applyLive() {
+  const live = S.live;
+  if (!S.ready || !live?.on) {
+    if (S.play instanceof SyncedStream) stopSource();
+    return;
+  }
+  if (S.play instanceof SyncedStream && S.play.live.id === live.id) return;
+  stopSource();
+  S.play = new SyncedStream(live);
+  listenLive(live);
+}
+
+// Reçoit le flux tant que ce direct dure, en se reconnectant si la liaison tombe.
+async function listenLive(live) {
+  const current = () => S.live?.id === live.id && S.play instanceof SyncedStream;
+  while (current()) {
+    try {
+      const res = await fetch(`${API}/live/stream`);
+      if (!res.ok) throw new Error(`flux refusé (${res.status})`);
+      const reader = res.body.getReader(), parser = new FrameParser();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!current()) return reader.cancel();
+        for (const frame of parser.push(value)) S.play.push(frame);
+      }
+    } catch (err) {
+      if (current()) log('direct interrompu :', err.message);
+    }
+    await sleep(500);
+  }
+}
+
+// Sources que l'hôte peut diffuser. La liste de base s'affiche tout de suite ; les entrées audio s'y
+// ajoutent quand le navigateur veut bien les donner : leurs noms ne sont lisibles qu'une fois l'accès
+// accordé, et Firefox ne répond pas tant que l'onglet n'est pas au premier plan.
+function refreshLiveSources() {
+  const select = $('liveSource');
+  const fill = (devices) => {
+    const options = [['default', 'Entrée audio par défaut']];
+    for (const d of devices) if (d.kind === 'audioinput' && d.label && d.deviceId !== 'default') options.push([d.deviceId, d.label]);
+    if (navigator.mediaDevices?.getDisplayMedia) options.push(['display', "Son d'un onglet ou de l'écran"]);
+    if (LOOPBACK) options.push(['test', 'Bruit de test']);
+    const before = select.value;
+    select.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
+    if (options.some(([value]) => value === before)) select.value = before;
+  };
+  if (!select.options.length) fill([]);
+  navigator.mediaDevices?.enumerateDevices?.().then(fill, () => {});
+}
+
+const RAW_AUDIO = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+
+// Hôte : capte la source choisie et l'envoie par tranches au serveur.
+async function startLive() {
+  const ctx = S.ctx, kind = $('liveSource').value;
+  let stream = null, source;
+  if (kind === 'test') {
+    const noise = ctx.createBuffer(2, 4 * ctx.sampleRate, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) noise.getChannelData(c).forEach((_, i, data) => { data[i] = Math.random() - 0.5; });
+    source = new AudioBufferSourceNode(ctx, { buffer: noise, loop: true });
+    source.start();
+  } else {
+    stream = kind === 'display'
+      // La vidéo est exigée par le navigateur pour un partage ; seul le son nous intéresse. Le son
+      // de l'onglet partagé est coupé sur place : il ressort, synchronisé, par le direct.
+      ? await navigator.mediaDevices.getDisplayMedia({ video: true, audio: { ...RAW_AUDIO, suppressLocalAudioPlayback: true } })
+      : await navigator.mediaDevices.getUserMedia({ audio: { ...RAW_AUDIO, channelCount: 2, ...(kind === 'default' ? {} : { deviceId: { exact: kind } }) } });
+    if (!stream.getAudioTracks().length) {
+      stream.getTracks().forEach((t) => t.stop());
+      throw new Error("aucun son dans ce partage : coche « partager l'audio » et choisis un onglet");
+    }
+    stream.getVideoTracks().forEach((t) => t.stop());
+    stream.getAudioTracks()[0].onended = () => stopLive(); // partage arrêté depuis le navigateur
+    source = ctx.createMediaStreamSource(stream);
+  }
+
+  const started = await (await fetch(`${API}/live/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: S.id, sampleRate: ctx.sampleRate, channels: 2, delayMs: Number($('liveDelay').value) }),
+  })).json();
+  if (!started.ok) {
+    stream?.getTracks().forEach((t) => t.stop());
+    throw new Error(started.error ?? 'refusé par le serveur');
+  }
+
+  const node = new AudioWorkletNode(ctx, 'live-capture', { channelCount: 2, channelCountMode: 'explicit', processorOptions: { chunk: LIVE.chunk } });
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+  source.connect(node).connect(mute).connect(ctx.destination); // garde le nœud actif sans rien faire entendre
+  const hosting = { stream, source, node, queue: [], sending: false, base: null, peak: 0 };
+  node.port.onmessage = (e) => {
+    const { start, left, right } = e.data;
+    hosting.base ??= start;
+    const pcm = new Int16Array(left.length * 2);
+    let peak = 0;
+    for (let i = 0; i < left.length; i++) {
+      peak = Math.max(peak, Math.abs(left[i]), Math.abs(right[i]));
+      pcm[2 * i] = Math.max(-32768, Math.min(32767, Math.round(left[i] * 32767)));
+      pcm[2 * i + 1] = Math.max(-32768, Math.min(32767, Math.round(right[i] * 32767)));
+    }
+    hosting.peak = peak;
+    // n : indice dans le flux ; t : heure serveur à laquelle ce premier échantillon a été capté.
+    hosting.queue.push(encodeFrame({ n: start - hosting.base, t: ctxToServer(start / ctx.sampleRate), channels: 2, pcm }));
+    if (hosting.queue.length > 20) hosting.queue.shift(); // réseau trop lent : on abandonne le plus ancien
+    sendLiveQueue(hosting);
+  };
+  node.port.postMessage({ on: true });
+  S.hosting = hosting;
+  refreshLiveSources();
+}
+
+// Envoie les tranches une à une, dans l'ordre.
+async function sendLiveQueue(hosting) {
+  if (hosting.sending) return;
+  hosting.sending = true;
+  while (hosting.queue.length && S.hosting === hosting) {
+    await fetch(`${API}/live/chunk`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: hosting.queue.shift() }).catch(() => {});
+  }
+  hosting.sending = false;
+}
+
+async function stopLive() {
+  const hosting = S.hosting;
+  S.hosting = null;
+  if (hosting) {
+    hosting.node.port.postMessage({ on: false });
+    hosting.source.disconnect();
+    hosting.node.disconnect();
+    if (hosting.source.stop) hosting.source.stop();
+    hosting.stream?.getTracks().forEach((t) => t.stop());
+  }
+  await fetch(`${API}/live/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
 }
 
 async function applyPlayback() {
@@ -558,7 +786,7 @@ async function trackingLoop() {
 // c'est ce qui permet d'analyser hors ligne une situation où le suivi échoue. Réservé à l'appareil
 // qui héberge le serveur, pour ne pas charger le Wi-Fi.
 async function uploadCapture(result) {
-  if (!isLocal) return;
+  if (!isLocal || S.live?.on) return; // en direct, il n'y a pas de fichier pour rejouer l'analyse
   const sr = S.ctx.sampleRate;
   const { first, data } = assembleRecording();
   const meta = {
@@ -578,29 +806,59 @@ async function uploadCapture(result) {
   await fetch(`${API}/capture`, { method: 'POST', headers: { 'X-Meta': encodeURIComponent(JSON.stringify(meta)) }, body: data });
 }
 
+// Musique en cours de lecture, vue comme une référence à comparer au micro, que ce soit un fichier
+// ou le direct. posAt : échantillon entendu à une heure serveur ; msAt : l'inverse ; read : copie des
+// échantillons (mono) ; key : change quand la lecture change ; sinceMs : début de ce qu'on peut lire.
+function currentReference() {
+  const sr = S.ctx.sampleRate;
+  if (S.live?.on) {
+    const st = S.play;
+    if (!(st instanceof SyncedStream) || !st.clock || st.sr !== sr) return null;
+    return { key: S.live.id, sinceMs: st.msAt(st.ring.start), posAt: (ms) => st.posAt(ms), msAt: (q) => st.msAt(q), read: (q, out) => st.ring.read(q, out) };
+  }
+  const pb = S.playback;
+  const buf = pb?.playing ? S.buffers.get(pb.track) : null;
+  if (!buf || buf.sampleRate !== sr) return null;
+  const channels = Array.from({ length: buf.numberOfChannels }, (_, c) => buf.getChannelData(c));
+  return {
+    key: pb,
+    sinceMs: pb.S0,
+    posAt: (ms) => (pb.P0 + (ms - pb.S0) / 1000) * sr,
+    msAt: (q) => pb.S0 + (q / sr - pb.P0) * 1000,
+    read(q, out) {
+      for (let i = 0; i < out.length; i++) {
+        const k = (((q + i) % buf.length) + buf.length) % buf.length; // la lecture boucle
+        let v = 0;
+        for (const ch of channels) v += ch[k];
+        out[i] = v / channels.length;
+      }
+      return true;
+    },
+  };
+}
+
 // Mesure le retard de chaque appareil sur une fenêtre de musique qui commence au plus tôt à
 // l'heure serveur `notBefore`. Renvoie null si le suivi s'arrête, { waiting } s'il n'y a rien à mesurer.
 async function analyzeTracking(notBefore, active) {
   const sr = S.ctx.sampleRate;
-  const pb = S.playback;
-  const buf = pb?.playing ? S.buffers.get(pb.track) : null;
-  if (!buf || buf.sampleRate !== sr) return { waiting: 'la musique ne joue pas' };
+  const ref = currentReference();
+  if (!ref) return { waiting: 'la musique ne joue pas' };
   const devices = S.clients.filter((c) => c.ready && c.slot != null);
   const readyKey = devices.map((c) => `${c.id}:${c.slot}`).join(',');
   const spanMs = ((TRACK_BLOCKS * PROBE.block) / sr) * 1000;
   // La fenêtre ne doit contenir ni le début de la lecture ni un changement de filtre.
-  const start = Math.max(notBefore, pb.S0 + 500, S.notchChangedMs + 1500);
+  const start = Math.max(notBefore, ref.sinceMs + 500, S.notchChangedMs + 1500);
 
   // Le trajet du micro décale toutes les arrivées d'un même montant, qui dérive et saute parfois de
   // plusieurs dizaines de ms : on cherche autour de la dernière valeur connue, puis plus large.
   let results = null;
   for (const centerMs of [S.trackCenterMs, ...TRACK_SWEEP_MS.map((d) => S.trackCenterMs + d)]) {
     const endMs = start + spanMs + centerMs + 500;
-    while (active() && S.playback === pb && serverNow() < endMs) await sleep(100);
+    while (active() && currentReference()?.key === ref.key && serverNow() < endMs) await sleep(100);
     if (!active()) return null;
     const stillSame = S.clients.filter((c) => c.ready && c.slot != null).map((c) => `${c.id}:${c.slot}`).join(',') === readyKey;
-    if (S.playback !== pb || !stillSame || S.notchChangedMs + 1500 > start) return { waiting: 'la lecture ou les appareils viennent de changer' };
-    const pass = await correlateWindow(start, centerMs, devices, pb, buf);
+    if (currentReference()?.key !== ref.key || !stillSame || S.notchChangedMs + 1500 > start) return { waiting: 'la lecture ou les appareils viennent de changer' };
+    const pass = await correlateWindow(start, centerMs, devices, ref);
     if (pass?.some((r) => r.detected)) {
       results = pass;
       break;
@@ -626,27 +884,20 @@ async function analyzeTracking(notBefore, active) {
 
 // Corrèle, bloc par bloc, la musique de référence avec ce que le micro a enregistré au moment où
 // chaque bloc devait être entendu (décalé de centerMs), dans la bande propre à chaque appareil.
-async function correlateWindow(start, centerMs, devices, pb, buf) {
+async function correlateWindow(start, centerMs, devices, ref) {
   const sr = S.ctx.sampleRate;
   const { first, data } = assembleRecording();
   const analyzer = new MusicAnalyzer(sr, new Map(devices.map((c) => [c.id, PROBE.bands[c.slot]])));
-  const channels = Array.from({ length: buf.numberOfChannels }, (_, c) => buf.getChannelData(c));
-  const ref = new Float32Array(PROBE.block);
+  const block = new Float32Array(PROBE.block);
   const len = PROBE.block + 2 * PROBE.maxLag;
   for (let b = 0; b < TRACK_BLOCKS; b++) {
     const offsetS = (b * PROBE.block) / sr;
     // Échantillon de musique entendu à cet instant, puis l'instant exact où lui est entendu.
-    const q = Math.round((pb.P0 + (start + offsetS * 1000 - pb.S0) / 1000) * sr);
-    const heardMs = pb.S0 + (q / sr - pb.P0) * 1000;
+    const q = Math.round(ref.posAt(start + offsetS * 1000));
+    const heardMs = ref.msAt(q);
     const x0 = Math.round((serverToCtx(heardMs) + centerMs / 1000) * sr) - PROBE.maxLag - first;
-    if (x0 < 0 || x0 + len > data.length) continue;
-    for (let i = 0; i < PROBE.block; i++) {
-      const k = (((q + i) % buf.length) + buf.length) % buf.length;
-      let v = 0;
-      for (const ch of channels) v += ch[k];
-      ref[i] = v / channels.length;
-    }
-    analyzer.addBlock(ref, data.subarray(x0, x0 + len), offsetS);
+    if (x0 < 0 || x0 + len > data.length || !ref.read(q, block)) continue;
+    analyzer.addBlock(block, data.subarray(x0, x0 + len), offsetS);
     if (b % 8 === 7) await sleep(0); // laisse respirer l'interface
   }
   // GapTracker décide qui est reconnu : l'appareil le plus net sert de référence, l'écart des autres
@@ -695,13 +946,16 @@ function connectEvents() {
     S.track = d.track;
     S.history = d.history ?? [];
     S.tracking = d.tracking ?? null;
+    S.live = d.live ?? null;
     onPlayback(d.playback);
     applyTracking();
+    applyLive();
     reportStatus();
     render();
   });
   on('clients', (d) => { S.clients = d; applyTracking(); render(); });
   on('tracking', (d) => { S.tracking = d; applyTracking(); render(); });
+  on('live', (d) => { S.live = d; applyLive(); render(); });
   on('track', (d) => { S.track = d; render(); });
   on('playback', (d) => { onPlayback(d); render(); });
   on('setLatency', (d) => { if (d.target === S.id) setLatency(S.latencyMs + d.deltaMs, 'manuelle'); });
@@ -820,6 +1074,23 @@ function relativeValues(res) {
   }).join(' · ');
 }
 
+function renderLive() {
+  const live = S.live?.on ? S.live : null;
+  $('liveBox').hidden = !S.isOwner;
+  $('liveToggle').textContent = S.hosting ? 'Arrêter le direct' : 'Diffuser en direct';
+  $('liveToggle').disabled = !!live && !S.hosting;
+  $('liveSource').disabled = $('liveDelay').disabled = !!live;
+  let info = '';
+  if (live) {
+    const host = S.clients.find((c) => c.id === live.hostId)?.name ?? '?';
+    info = `En direct depuis ${host}, entendu ${fmt(live.delayMs / 1000)} s après la source.`;
+    if (S.hosting) info += S.hosting.peak < 0.001 ? ' Aucun son capté pour l’instant : vérifie la source choisie.' : ` Niveau capté : ${fmt(20 * Math.log10(S.hosting.peak), 0)} dB.`;
+    if (S.play?.late) info += ' Le son arrive trop tard sur cet appareil : relance le direct avec un retard plus grand.';
+  }
+  $('liveInfo').textContent = info || S.liveError;
+  $('liveInfo').classList.toggle('warn', !!S.play?.late || (!info && !!S.liveError));
+}
+
 function renderTracking() {
   const tr = S.tracking;
   if (!tr) return;
@@ -882,14 +1153,17 @@ function render() {
   const pb = S.playback;
   if (pb) {
     if (document.activeElement !== source) source.value = pb.track;
-    $('play').disabled = pb.playing;
+    const live = !!S.live?.on;
+    $('play').disabled = pb.playing || live;
     $('pause').disabled = !pb.playing;
+    source.disabled = live;
     const dur = S.buffers.get(pb.track)?.duration;
     let pos = pb.playing ? Math.max(0, pb.P0 + (serverNow() - pb.S0) / 1000) : pb.P0;
     if (dur) pos %= dur;
     $('pos').textContent = `${Math.floor(pos / 60)}:${String(Math.floor(pos % 60)).padStart(2, '0')}`;
     $('playHint').textContent = pb.playing && !S.play ? 'Chargement de la piste…' : '';
   }
+  renderLive();
   renderDevices();
   renderCalib();
   renderTracking();
@@ -911,6 +1185,7 @@ async function join() {
   S.chirpBus.gain.value = 0.8;
   S.chirpBus.connect(S.master);
   S.musicBus = ctx.createGain();
+  await Promise.all(['/live-player-worklet.js', '/live-capture-worklet.js'].map((url) => ctx.audioWorklet.addModule(url)));
   S.notchDelay = (PROBE.taps - 1) / 2 / ctx.sampleRate;
   const chirp = makeChirp(ctx.sampleRate);
   S.chirpBuf = ctx.createBuffer(1, chirp.length, ctx.sampleRate);
@@ -950,6 +1225,8 @@ async function join() {
   reportStatus();
   applyTracking(); // installe la chaîne musique avant toute lecture
   applyPlayback();
+  applyLive();
+  refreshLiveSources();
   render();
 }
 
@@ -979,6 +1256,16 @@ $('tracking').onclick = async () => {
   return cmd('tracking', { on: true });
 };
 $('releaseMic').onclick = releaseMic;
+$('liveToggle').onclick = async () => {
+  S.liveError = '';
+  try {
+    await (S.hosting ? stopLive() : startLive());
+  } catch (err) {
+    log('direct impossible :', err.message);
+    S.liveError = `Direct impossible : ${err.message}`;
+  }
+  render();
+};
 $('file').onchange = async (e) => {
   const f = e.target.files[0];
   if (!f) return;
@@ -1004,7 +1291,8 @@ async function start() {
   }
   $('roomName').textContent = meta.name;
   document.title = `${meta.name} — ${BRAND}`;
-  $('fileLabel').hidden = !meta.isOwner; // le morceau est stocké sur le serveur : seul le créateur en envoie
+  S.isOwner = meta.isOwner; // envoi d'un morceau et direct passent par le serveur : réservés au créateur
+  $('fileLabel').hidden = !meta.isOwner;
 
   // Lien à ouvrir sur les autres appareils. Depuis localhost, c'est l'adresse du réseau local qu'il faut donner.
   const link = (origin) => `${origin}/r/${ROOM}`;

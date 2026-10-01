@@ -80,7 +80,7 @@ try {
   // Passage par du JSON : le pilotage de Firefox tronque les objets imbriqués.
   const snapshotOf = async (page) => JSON.parse(await page.evaluate(() => {
     const { S } = window.sync;
-    return JSON.stringify({ id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing, tracks: S.history.filter((h) => h.mode === 'track'), notch: S.notchKey, wait: S.trackWait });
+    return JSON.stringify({ id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing, tracks: S.history.filter((h) => h.mode === 'track'), notch: S.notchKey, wait: S.trackWait, live: !!S.live?.on, ringEnd: S.play?.ring?.end ?? 0, late: !!S.play?.late });
   }));
 
   // A se connecte depuis l'accueil et crée une salle, comme le ferait l'hôte.
@@ -195,6 +195,34 @@ try {
   await sleep(1500);
   sa = await state(a); sb = await state(b);
   assert.ok(sa.notch === '' && sb.notch === '', 'filtres retirés avec le suivi');
+
+  // Direct : A diffuse un bruit de test capté sur place ; A et B le rejouent, calés sur l'horloge
+  // commune, puis A se retrouve dans ce flux comme il se retrouvait dans le fichier.
+  const chosen = await a.$eval('#liveSource', (el) => { el.value = 'test'; return `${el.value} parmi ${[...el.options].map((o) => o.value).join(',')}`; });
+  assert.ok(chosen.startsWith('test '), `source de test sélectionnée (${chosen})`);
+  await click(a, '#liveToggle');
+  for (let i = 0; i < 20 && !((await state(b)).ringEnd > 96000); i++) await sleep(300);
+  await sleep(3000);
+  sa = await state(a); sb = await state(b);
+  console.log('direct    A:', sa.errMs?.toFixed(2), 'ms   B:', sb.errMs?.toFixed(2), 'ms   reçu par B :', (sb.ringEnd / 48000).toFixed(1), 's');
+  assert.ok(sa.live && sb.live, `direct annoncé aux deux appareils (page : « ${await a.$eval('#liveInfo', (el) => el.textContent)} »)`);
+  assert.ok(sb.ringEnd > 96000, 'B reçoit le flux');
+  assert.ok(sa.playing && sb.playing && !sa.late && !sb.late, 'le son arrive à temps');
+  assert.ok(Math.abs(sa.errMs) < 3 && Math.abs(sb.errMs) < 3, 'lecture du direct calée à moins de 3 ms');
+
+  const before = sa.tracks.length;
+  await click(a, '#tracking');
+  for (let i = 0; i < 80 && (await state(a)).tracks.length < before + 2; i++) await sleep(500);
+  sa = await state(a);
+  assert.ok(sa.tracks.length >= before + 2, 'mesures de suivi pendant le direct');
+  const liveOwn = sa.tracks[sa.tracks.length - 1].results.find((r) => r.client === sa.id);
+  console.log('suivi en direct A:', liveOwn.ms?.toFixed(2), 'ms  score', liveOwn.psr.toFixed(1));
+  assert.ok(liveOwn.detected && Math.abs(liveOwn.ms) < TRACK_TOLERANCE_MS, `A attendu à ~0 ms dans le direct, mesuré ${liveOwn.ms}`);
+  await click(a, '#tracking');
+  await click(a, '#liveToggle');
+  await sleep(1500);
+  sa = await state(a); sb = await state(b);
+  assert.ok(!sa.live && !sb.live && !sa.playing && !sb.playing, 'direct arrêté partout');
 
   const captures = fs.readdirSync(path.join(CAPTURE_DIR, code));
   assert.ok(captures.some((f) => f.endsWith('.f32')) && captures.some((f) => f.endsWith('.json')), 'enregistrement du micro reçu par le serveur');

@@ -42,6 +42,21 @@
         <span id="pos" class="mono"></span>
       </div>
       <p class="hint" id="playHint"></p>
+      <div id="liveBox" hidden>
+        <h2>En direct depuis cet ordinateur</h2>
+        <div class="row">
+          <select id="liveSource" aria-label="Source du direct"></select>
+          <select id="liveDelay" aria-label="Retard du direct">
+            <option value="700">retard 0,7 s</option>
+            <option value="1000" selected>retard 1 s</option>
+            <option value="1500">retard 1,5 s</option>
+            <option value="2500">retard 2,5 s</option>
+          </select>
+          <button id="liveToggle">Diffuser en direct</button>
+        </div>
+        <p class="hint">Carte son, câble virtuel, micro ou onglet : le son capté ici est rejoué, synchronisé, sur tous les appareils de la salle. Le retard doit dépasser la plus grande compensation affichée plus bas, avec 0,3 s de marge.</p>
+      </div>
+      <p class="hint" id="liveInfo"></p>
     </section>
 
     <section class="card" id="devicesCard" hidden>

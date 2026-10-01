@@ -107,3 +107,5 @@ a.button.primary { background: var(--accent); border-color: var(--accent); color
 .device .nudge a.button { min-height: 36px; padding: 4px 10px; font-size: 13px; flex: 1; }
 .account { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
 .account button { min-height: 32px; padding: 4px 10px; font-size: 13px; }
+
+#liveBox { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
