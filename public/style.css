@@ -64,6 +64,7 @@ input, select, button, .filebtn {
   min-height: 42px;
 }
 input, select { flex: 1 1 160px; min-width: 0; }
+input[type='range'] { accent-color: var(--accent); border: 0; padding: 0; }
 button, .filebtn { cursor: pointer; color: var(--text); font-size: 15px; display: inline-flex; align-items: center; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
 button:disabled { opacity: 0.5; cursor: default; }

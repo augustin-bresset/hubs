@@ -43,7 +43,7 @@ try {
   };
   const state = (page) => page.evaluate(() => {
     const { S } = window.unisson;
-    return { id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing };
+    return { id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing, tracks: S.history.filter((h) => h.mode === 'track'), sig: !!S.sig };
   });
 
   const a = await open(`http://localhost:${HTTP_PORT}/?loopback`);
@@ -107,6 +107,24 @@ try {
   console.log('reprise   A:', sa.errMs?.toFixed(2), 'ms   B:', sb.errMs?.toFixed(2), 'ms');
   assert.ok(sa.playing && sb.playing);
   assert.ok(Math.abs(sa.errMs) < 3 && Math.abs(sb.errMs) < 3);
+
+  // Suivi continu pendant la lecture : A retrouve sa propre signature sous le métronome,
+  // au retard attendu (compensation déjà appliquée, donc proche de 0), sans rien corriger seul.
+  await click(a, '#tracking');
+  for (let i = 0; i < 80 && (await state(a)).tracks.length < 2; i++) await sleep(500);
+  sa = await state(a); sb = await state(b);
+  assert.ok(sa.sig && sb.sig, 'chaque appareil joue sa signature');
+  const track = sa.tracks[sa.tracks.length - 1];
+  const own = track.results.find((r) => r.client === sa.id);
+  console.log('suivi     A:', own.ms?.toFixed(2), 'ms  score', own.psr.toFixed(1), ' glissement', own.driftPpm.toFixed(0), 'ppm   B score', track.results.find((r) => r.client !== sa.id).psr.toFixed(1));
+  assert.ok(own.detected && Math.abs(own.ms) < 1, `signature de A attendue à ~0 ms, mesurée ${own.ms}`);
+  assert.equal(track.results.find((r) => r.client !== sa.id).detected, false, 'signature de B inaudible pour A');
+  assert.deepEqual(track.corrections, [], 'pas de correction avec un seul appareil détecté');
+  assert.ok(Math.abs(sa.errMs) < 3 && Math.abs(sb.errMs) < 3, 'la lecture reste calée pendant le suivi');
+  await click(a, '#tracking');
+  await sleep(1500);
+  sa = await state(a); sb = await state(b);
+  assert.ok(!sa.sig && !sb.sig, 'signatures arrêtées avec le suivi');
 
   assert.deepEqual(errors, [], 'aucune erreur JavaScript');
   console.log('OK');

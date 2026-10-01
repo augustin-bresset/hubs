@@ -1,5 +1,5 @@
-import { makeChirp, detectChirp, median } from './dsp.js';
-import { fitClock, localToServer, serverToLocal } from './sync.js';
+import { makeChirp, detectChirp, median, SIG, makeSignature, signatureTemplates, SignatureAnalyzer } from './dsp.js';
+import { fitClock, localToServer, serverToLocal, gapCorrections } from './sync.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -15,7 +15,13 @@ const KI = 0.05; // 1/s² : apprend la dérive constante en une vingtaine de sec
 const INTEG_MAX = 5e-4;
 const INTEG_FREEZE_S = 0.003;
 const STABILITY_ROUNDS = 10;
-const MODE_LABEL = { measure: 'calibration', verify: 'vérification', probe: 'mesure' };
+const MODE_LABEL = { measure: 'calibration', verify: 'vérification', probe: 'mesure', track: 'suivi' };
+const TRACK_PERIODS = 4; // périodes de signature par mesure de suivi (5,5 s)
+const TRACK_SCORE_MIN = 8; // en simulation : signature absente ≤ 5, signature présente ≥ 10 jusqu'à 24 dB sous la musique
+const TRACK_SETTLE_MS = 4000; // attente après une correction, le temps que la lecture se recale
+// Décalages essayés quand rien n'est trouvé autour de la dernière position connue.
+const TRACK_SWEEP_MS = [150, -150, 300, -300, 450, -450, 600, -600];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 
@@ -51,6 +57,12 @@ const S = {
   history: [],
   testing: false,
   testRound: 0,
+  tracking: null, // état du suivi continu diffusé par le serveur
+  sig: null, // signature jouée par cet appareil
+  templates: new Map(), // numéro de signature -> spectres de référence
+  trackRunning: false,
+  trackCenterMs: 0, // décalage commun (trajet du micro) autour duquel chercher les signatures
+  lastTrack: null,
 };
 sessionStorage.setItem('unisson.id', S.id);
 
@@ -266,7 +278,8 @@ async function applyPlayback() {
 function driftTick() {
   if (S.ctx.state !== 'running') return;
   S.play?.tick();
-  const err = S.play?.err;
+  S.sig?.tick();
+  const err = (S.play ?? S.sig)?.err;
   S.errMs = err == null ? null : err * 1000;
 }
 
@@ -288,12 +301,16 @@ async function ensureRecorder() {
   const mute = ctx.createGain();
   mute.gain.value = 0;
   node.connect(mute).connect(ctx.destination); // garde le nœud actif sans rien faire entendre
-  node.port.onmessage = (e) => S.chunks.push(e.data);
+  node.port.onmessage = (e) => {
+    S.chunks.push(e.data);
+    // En suivi continu l'enregistrement ne s'arrête jamais : on ne garde que les 14 dernières secondes.
+    if (S.trackRunning) while (S.chunks[0].start < e.data.start - 14 * ctx.sampleRate) S.chunks.shift();
+  };
 
   if (LOOPBACK) {
     const delay = ctx.createDelay(1);
     delay.delayTime.value = LOOPBACK_DELAY;
-    S.chirpBus.connect(delay).connect(node);
+    S.master.connect(delay).connect(node); // tout ce que l'enceinte jouerait
     S.micLabel = 'boucle interne (test)';
   } else {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('micro indisponible : ouvre la page en https:// (ou via localhost)');
@@ -402,14 +419,20 @@ function onCalib(ev) {
   }, Math.max(0, ev.end - serverNow()) + 300);
 }
 
-function analyze(ev, expected) {
-  const sr = S.ctx.sampleRate;
+// Met bout à bout les blocs enregistrés ; `first` est l'indice, dans l'horloge audio, du premier échantillon.
+function assembleRecording() {
   const chunks = S.chunks;
   if (!chunks.length) throw new Error('aucun son enregistré');
   const first = Math.min(...chunks.map((c) => c.start));
   const last = Math.max(...chunks.map((c) => c.start + c.data.length));
-  const rec = new Float32Array(last - first);
-  for (const c of chunks) rec.set(c.data, c.start - first);
+  const data = new Float32Array(last - first);
+  for (const c of chunks) data.set(c.data, c.start - first);
+  return { first, data };
+}
+
+function analyze(ev, expected) {
+  const sr = S.ctx.sampleRate;
+  const { first, data: rec } = assembleRecording();
 
   const template = makeChirp(sr);
   const byClient = new Map();
@@ -441,13 +464,129 @@ function analyze(ev, expected) {
 }
 
 function onCalibResult(res) {
-  S.lastCalib = res;
   S.history.push(res);
-  const mine = res.results.find((r) => r.client === S.id);
-  if (res.mode === 'measure' && mine?.detected) setLatency(mine.ms, 'micro');
+  if (S.history.length > 300) S.history.shift();
+  if (res.mode === 'track') {
+    S.lastTrack = res;
+    const fix = res.corrections.find((c) => c.client === S.id);
+    if (fix) setLatency(S.latencyMs + fix.deltaMs, 'suivi');
+  } else {
+    S.lastCalib = res;
+    const mine = res.results.find((r) => r.client === S.id);
+    if (res.mode === 'measure' && mine?.detected) setLatency(mine.ms, 'micro');
+  }
   S.calibWaiters.get(res.calibId)?.(res);
   S.calibWaiters.delete(res.calibId);
   render();
+}
+
+// --- Suivi continu ----------------------------------------------------------
+
+// Démarre, règle ou arrête la signature de cet appareil selon l'état diffusé par le serveur.
+function applyTracking() {
+  const tr = S.tracking;
+  const code = S.clients.find((c) => c.id === S.id)?.code;
+  if (!S.ready || !tr?.on || code == null) {
+    S.sig?.stop();
+    S.sig = null;
+    return;
+  }
+  const level = 10 ** (tr.levelDb / 20);
+  if (!S.sig) {
+    const buf = S.ctx.createBuffer(1, SIG.length, SIG.rate);
+    buf.copyToChannel(makeSignature(code), 0);
+    S.sig = new SyncedLoop(buf, 0, 0, level); // phase calée sur l'heure serveur zéro
+  } else if (S.sig.level !== level) S.sig.setLevel(level);
+  if (tr.listener === S.id && !S.trackRunning) trackingLoop();
+}
+
+async function trackingLoop() {
+  S.trackRunning = true;
+  const active = () => S.tracking?.on && S.tracking.listener === S.id && !!S.recorder;
+  try {
+    await ensureRecorder();
+    S.chunks = [];
+    S.recorder.port.postMessage({ on: true });
+    const periodMs = (SIG.length / SIG.rate) * 1000;
+    let notBefore = serverNow() + 1500; // le temps que chaque appareil lance sa signature
+    while (active()) {
+      const start = Math.ceil(notBefore / periodMs) * periodMs;
+      const result = await analyzeTracking(start, active);
+      if (!result) break;
+      await cmd('calibResult', { result });
+      notBefore = serverNow() + (result.corrections.length ? TRACK_SETTLE_MS : 0);
+    }
+  } catch (err) {
+    log('suivi interrompu :', err.message);
+  }
+  S.recorder?.port.postMessage({ on: false });
+  S.trackRunning = false;
+  if (S.tracking?.on && S.tracking.listener === S.id) cmd('tracking', { on: false }).catch(() => {});
+}
+
+// Mesure le retard de chaque signature sur la fenêtre qui commence à l'heure serveur `start`.
+async function analyzeTracking(start, active) {
+  const devices = S.clients.filter((c) => c.ready && c.code != null);
+  for (const c of devices) if (!S.templates.has(c.code)) S.templates.set(c.code, signatureTemplates(makeSignature(c.code)));
+
+  // Le trajet du micro décale toutes les arrivées d'un même montant, qui dérive et saute parfois de
+  // plusieurs dizaines de ms : on cherche autour de la dernière valeur connue, puis plus large.
+  let results = null;
+  for (const centerMs of [S.trackCenterMs, ...TRACK_SWEEP_MS.map((d) => S.trackCenterMs + d)]) {
+    const endMs = start + TRACK_PERIODS * (SIG.length / SIG.rate) * 1000 + centerMs + 500;
+    while (active() && serverNow() < endMs) await sleep(100);
+    if (!active()) return null;
+    const pass = await correlateWindow(start, centerMs, devices);
+    if (pass?.some((r) => r.detected)) {
+      results = pass;
+      break;
+    }
+    results ??= pass;
+  }
+  results ??= devices.map((c) => ({ client: c.id, name: c.name, detected: false, ms: null, psr: 0, driftPpm: 0 }));
+
+  const found = results.filter((r) => r.detected);
+  if (found.length) S.trackCenterMs = found.reduce((sum, r) => sum + r.ms, 0) / found.length;
+  return {
+    calibId: Math.random().toString(36).slice(2),
+    mode: 'track',
+    listener: S.id,
+    mic: S.micLabel,
+    results,
+    corrections: gapCorrections(found.map((r) => ({ client: r.client, ms: r.ms }))),
+  };
+}
+
+async function correlateWindow(start, centerMs, devices) {
+  const sr = S.ctx.sampleRate;
+  const { first, data } = assembleRecording();
+  const analyzer = new SignatureAnalyzer(new Map(devices.map((c) => [c.id, S.templates.get(c.code)])));
+  const len = SIG.block + 2 * SIG.maxLag, step = sr / SIG.rate;
+  const slice = new Float32Array(len);
+  const blocks = SIG.length / SIG.block;
+  let used = 0;
+  for (let m = 0; m < TRACK_PERIODS; m++) {
+    for (let j = 0; j < blocks; j++) {
+      const offsetS = (m * SIG.length + j * SIG.block) / SIG.rate;
+      // Début de la tranche dans l'enregistrement, ramenée à la fréquence de la signature.
+      const x0 = (serverToCtx(start + offsetS * 1000) + centerMs / 1000 - SIG.maxLag / SIG.rate) * sr - first;
+      if (x0 < 0 || x0 + len * step + 1 >= data.length) continue;
+      for (let i = 0; i < len; i++) {
+        const x = x0 + i * step, k = Math.floor(x);
+        slice[i] = data[k] + (x - k) * (data[k + 1] - data[k]);
+      }
+      analyzer.addBlock(j, slice, offsetS);
+      used++;
+    }
+    await sleep(0); // laisse respirer l'interface entre deux périodes
+  }
+  if (used < (TRACK_PERIODS * blocks) / 2) return null;
+  const out = analyzer.results();
+  return devices.map((c) => {
+    const r = out.get(c.id);
+    const detected = r.score >= TRACK_SCORE_MIN;
+    return { client: c.id, name: c.name, detected, ms: detected ? centerMs + (r.lag / SIG.rate) * 1000 : null, psr: r.score, driftPpm: r.drift * 1e6 };
+  });
 }
 
 // --- Événements serveur -----------------------------------------------------
@@ -483,11 +622,14 @@ function connectEvents() {
     S.clients = d.clients;
     S.track = d.track;
     S.history = d.history ?? [];
+    S.tracking = d.tracking ?? null;
     onPlayback(d.playback);
+    applyTracking();
     reportStatus();
     render();
   });
-  on('clients', (d) => { S.clients = d; render(); });
+  on('clients', (d) => { S.clients = d; applyTracking(); render(); });
+  on('tracking', (d) => { S.tracking = d; applyTracking(); render(); });
   on('track', (d) => { S.track = d; render(); });
   on('playback', (d) => { onPlayback(d); render(); });
   on('setLatency', (d) => { if (d.target === S.id) setLatency(S.latencyMs + d.deltaMs, 'manuelle'); });
@@ -540,7 +682,7 @@ function renderDevices() {
 function renderCalib() {
   const res = S.lastCalib;
   const box = $('calibResult');
-  $('calibrate').disabled = $('verify').disabled = S.calibBusy;
+  $('calibrate').disabled = $('verify').disabled = S.calibBusy || !!S.tracking?.on;
   $('releaseMic').hidden = !S.micStream;
   const mic = S.micLabel ? `Micro utilisé : ${S.micLabel}.` : '';
   const bt = /bluez|bluetooth|headset|hands.?free|mains.libres/i.test(S.micLabel)
@@ -593,14 +735,48 @@ function gapOf(res) {
   return ok.length >= 2 && ok.length === res.results.length ? Math.max(...ok) - Math.min(...ok) : null;
 }
 
+const signed = (v) => `${v >= 0 ? '+' : ''}${fmt(v)}`;
+const nameOf = (res, client) => res.results.find((r) => r.client === client)?.name ?? client;
+
+// Valeurs d'une mesure rapportées à un appareil de référence (celui qui écoute s'il est détecté).
+function relativeValues(res) {
+  const ok = res.results.filter((r) => r.detected);
+  const ref = ok.find((r) => r.client === res.listener) ?? ok[0];
+  return res.results.map((r) => `${r.name} ${!r.detected ? 'non détecté' : r === ref ? 'référence' : `${signed(r.ms - ref.ms)} ms`}`).join(' · ');
+}
+
+function renderTracking() {
+  const tr = S.tracking;
+  if (!tr) return;
+  const listener = S.clients.find((c) => c.id === tr.listener)?.name;
+  $('tracking').textContent = !tr.on ? 'Activer le suivi (cet appareil écoute)' : tr.listener === S.id ? 'Arrêter le suivi' : `Arrêter le suivi (écoute : ${listener ?? '?'})`;
+  $('tracking').disabled = S.calibBusy;
+  if (document.activeElement !== $('sigLevel')) $('sigLevel').value = tr.levelDb;
+  $('sigLevelValue').textContent = `${$('sigLevel').value} dB`;
+  const last = S.lastTrack;
+  let info = '';
+  if (tr.on && !last) info = 'Première mesure dans quelques secondes…';
+  else if (tr.on) {
+    const found = last.results.filter((r) => r.detected).length;
+    info = found === 0
+      ? 'Aucune signature détectée : monte le niveau de la signature ou rapproche les enceintes du micro.'
+      : found === 1
+        ? `Un seul appareil détecté (${relativeValues(last)}) : il en faut deux pour mesurer un écart.`
+        : `Dernière mesure à ${new Date(last.at).toLocaleTimeString()} : ${relativeValues(last)}. ${last.corrections.length ? `Corrections : ${last.corrections.map((c) => `${nameOf(last, c.client)} ${signed(c.deltaMs)} ms`).join(', ')}.` : 'Aucune correction nécessaire.'}`;
+  }
+  $('trackInfo').textContent = info;
+}
+
 function renderHistory() {
   $('stability').textContent = S.testing ? `Arrêter le test (mesure ${S.testRound}/${STABILITY_ROUNDS})` : `Test de stabilité (${STABILITY_ROUNDS} mesures)`;
-  $('stability').disabled = S.calibBusy && !S.testing;
+  $('stability').disabled = (S.calibBusy && !S.testing) || !!S.tracking?.on;
   $('historyBox').hidden = S.history.length === 0;
-  const lines = S.history.map((h) => {
-    const values = h.results.map((r) => `${r.name} ${r.detected ? `${fmt(r.ms)} ms` : 'non détecté'}`).join(' · ');
+  const lines = S.history.slice(-60).map((h) => {
+    const absolute = h.mode === 'measure' || h.mode === 'probe';
+    const values = absolute ? h.results.map((r) => `${r.name} ${r.detected ? `${fmt(r.ms)} ms` : 'non détecté'}`).join(' · ') : relativeValues(h);
     const gap = gapOf(h);
-    return `${new Date(h.at).toLocaleTimeString()}  ${MODE_LABEL[h.mode].padEnd(12)}  ${values}${gap === null ? '' : `  →  écart ${fmt(gap)} ms`}`;
+    const fixes = h.corrections?.length ? `  corrections : ${h.corrections.map((c) => `${nameOf(h, c.client)} ${signed(c.deltaMs)} ms`).join(', ')}` : '';
+    return `${new Date(h.at).toLocaleTimeString()}  ${MODE_LABEL[h.mode].padEnd(12)}  ${values}${gap === null ? '' : `  →  écart ${fmt(gap)} ms`}${fixes}`;
   });
   const text = lines.join('\n');
   if ($('history').textContent !== text) $('history').textContent = text;
@@ -619,7 +795,7 @@ function render() {
   net.textContent = ok ? `horloge ±${fmt(rtt / 2)} ms` : 'hors ligne';
   net.className = `pill ${ok ? 'ok' : 'bad'}`;
 
-  for (const id of ['playCard', 'devicesCard', 'calibCard', 'logCard']) $(id).hidden = !S.ready;
+  for (const id of ['playCard', 'devicesCard', 'calibCard', 'trackCard', 'logCard']) $(id).hidden = !S.ready;
   $('joinCard').hidden = S.ready;
   if (!S.ready) return;
 
@@ -642,6 +818,7 @@ function render() {
   }
   renderDevices();
   renderCalib();
+  renderTracking();
   renderHistory();
 }
 
@@ -692,6 +869,7 @@ async function join() {
   log(`son activé (${ctx.sampleRate} Hz)`);
   reportStatus();
   applyPlayback();
+  applyTracking();
   render();
 }
 
@@ -707,6 +885,20 @@ $('source').onchange = (e) => cmd('track', { track: e.target.value });
 $('calibrate').onclick = () => runCalibration('measure');
 $('verify').onclick = () => runCalibration('verify');
 $('stability').onclick = stabilityTest;
+$('tracking').onclick = async () => {
+  if (S.tracking?.on) return cmd('tracking', { on: false });
+  try {
+    await ensureRecorder();
+  } catch (err) {
+    $('trackInfo').textContent = `Micro inaccessible : ${err.message}`;
+    return;
+  }
+  S.trackCenterMs = 0;
+  S.lastTrack = null;
+  return cmd('tracking', { on: true });
+};
+$('sigLevel').oninput = () => { $('sigLevelValue').textContent = `${$('sigLevel').value} dB`; };
+$('sigLevel').onchange = () => cmd('tracking', { levelDb: Number($('sigLevel').value) });
 $('releaseMic').onclick = releaseMic;
 $('file').onchange = async (e) => {
   const f = e.target.files[0];

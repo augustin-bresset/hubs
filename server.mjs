@@ -37,6 +37,9 @@ const BOOT = randomUUID(); // l'horloge repart de zéro à chaque démarrage : l
 
 const clients = new Map(); // id -> { id, name, ready, status, res }
 const history = []; // résultats de calibration, du plus ancien au plus récent
+const codes = new Map(); // id d'appareil -> numéro de signature, stable d'une reconnexion à l'autre
+// Suivi continu : chaque appareil joue sa signature, celui qui écoute mesure les écarts en permanence.
+let tracking = { on: false, listener: null, levelDb: -36 };
 let track = null; // dernier fichier envoyé : { id, name, type, data }
 // Position P0 (s) de la piste à l'instant serveur S0 (ms).
 let playback = { track: 'metronome', playing: false, S0: 0, P0: 0 };
@@ -47,7 +50,7 @@ function send(res, event, data) {
 function broadcast(event, data) {
   for (const c of clients.values()) send(c.res, event, data);
 }
-const clientList = () => [...clients.values()].map(({ id, name, ready, status }) => ({ id, name, ready, status }));
+const clientList = () => [...clients.values()].map(({ id, name, ready, status, code }) => ({ id, name, ready, status, code }));
 const trackInfo = () => track && { id: track.id, name: track.name };
 
 let clientsTimer = null;
@@ -68,6 +71,7 @@ const currentPos = () => (playback.playing ? playback.P0 + (now() - playback.S0)
 function startCalib(msg) {
   const emitters = [...clients.values()].filter((c) => c.ready);
   if (!clients.get(msg.id)?.ready) return { ok: false, error: "l'appareil qui écoute n'a pas rejoint" };
+  if (tracking.on) return { ok: false, error: 'arrête le suivi continu avant de calibrer' };
   if (playback.playing) setPlayback({ playing: false, P0: currentPos() });
   const schedule = [];
   let T = now() + CALIB_LEAD_MS;
@@ -91,11 +95,35 @@ function recordCalib(result) {
     results: result.results.map((r) => ({ ...r, compMs: clients.get(r.client)?.status?.latencyMs ?? null })),
   };
   history.push(entry);
-  if (history.length > 100) history.shift();
+  if (history.length > 500) history.shift();
   const fmt = (v) => (v == null ? '–' : v.toFixed(1));
-  const parts = entry.results.map((r) => `${r.name}=${r.detected ? `${fmt(r.ms)}ms` : 'non détecté'} (dispersion ${fmt(r.spreadMs)}, ${r.hits}/${r.reps}, score ${Math.round(Math.min(r.psr, 999))}, comp ${fmt(r.compMs)})`);
-  console.log(`[${new Date(entry.at).toLocaleTimeString('fr-FR')}] ${entry.mode.padEnd(7)} ${parts.join('  ')}`);
+  const signed = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}`;
+  const nameOf = (id) => entry.results.find((r) => r.client === id)?.name ?? id;
+  const parts = entry.results.map((r) => {
+    const value = r.detected ? `${fmt(r.ms)}ms` : 'non détecté';
+    const detail = entry.mode === 'track'
+      ? `score ${fmt(r.psr)}, glissement ${Math.round(r.driftPpm ?? 0)} ppm`
+      : `dispersion ${fmt(r.spreadMs)}, ${r.hits}/${r.reps}, score ${Math.round(Math.min(r.psr, 999))}`;
+    return `${r.name}=${value} (${detail}, comp ${fmt(r.compMs)})`;
+  });
+  const fixes = entry.mode === 'track' && entry.corrections.length
+    ? `  corrections : ${entry.corrections.map((c) => `${nameOf(c.client)} ${signed(c.deltaMs)}ms`).join(', ')}`
+    : '';
+  console.log(`[${new Date(entry.at).toLocaleTimeString('fr-FR')}] ${entry.mode.padEnd(7)} ${parts.join('  ')}${fixes}`);
   broadcast('calibResult', entry);
+}
+
+function setTracking(msg) {
+  if (typeof msg.levelDb === 'number') tracking.levelDb = Math.max(-70, Math.min(-20, msg.levelDb));
+  if (msg.on === true) {
+    if (!clients.get(msg.id)?.ready) return { ok: false, error: "l'appareil qui écoute n'a pas rejoint" };
+    tracking = { ...tracking, on: true, listener: msg.id };
+  } else if (msg.on === false) {
+    tracking = { ...tracking, on: false, listener: null };
+  }
+  console.log(`[${new Date().toLocaleTimeString('fr-FR')}] suivi ${tracking.on ? 'actif' : 'arrêté'}, signature à ${tracking.levelDb} dB`);
+  broadcast('tracking', tracking);
+  return { ok: true };
 }
 
 function handleCmd(msg) {
@@ -130,6 +158,8 @@ function handleCmd(msg) {
     case 'calibResult':
       recordCalib(msg.result);
       return { ok: true };
+    case 'tracking':
+      return setTracking(msg);
     default:
       return { ok: false, error: 'commande inconnue' };
   }
@@ -186,14 +216,16 @@ async function handle(req, res) {
     const old = clients.get(id);
     old?.res.end();
     const name = (url.searchParams.get('name') || 'Appareil').slice(0, 40);
-    const client = { ready: false, status: null, ...old, id, name, res };
+    if (!codes.has(id)) codes.set(id, codes.size);
+    const client = { ready: false, status: null, ...old, id, name, res, code: codes.get(id) };
     clients.set(id, client);
-    send(res, 'hello', { clients: clientList(), track: trackInfo(), playback, history });
+    send(res, 'hello', { clients: clientList(), track: trackInfo(), playback, history, tracking });
     broadcastClients();
     req.on('close', () => {
       if (clients.get(id)?.res === res) {
         clients.delete(id);
         broadcastClients();
+        if (tracking.listener === id) setTracking({ on: false }); // plus personne n'écoute
       }
     });
     return;

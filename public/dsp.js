@@ -115,7 +115,7 @@ export function median(values) {
 // --- Suivi continu : signature propre à chaque appareil ---------------------
 // Chaque appareil joue en boucle, à bas niveau, un bruit à bande limitée qui lui est propre.
 // Le micro de référence retrouve chaque signature par corrélation et en déduit son retard.
-// La corrélation se fait par blocs courts dont on additionne les énergies : un bloc de 85 ms
+// La corrélation se fait par blocs courts dont on additionne les énergies : un bloc de 171 ms
 // reste cohérent malgré les petites variations de vitesse des horloges, ce qu'une corrélation
 // d'un seul tenant sur plusieurs secondes ne tolère pas.
 
@@ -124,9 +124,9 @@ export const SIG = {
   length: 65536, // une période : 1,365 s
   f0: 2000,
   f1: 6000,
-  block: 4096, // 85 ms
+  block: 8192, // 171 ms
   fftSize: 16384,
-  maxLag: 4800, // retard recherché : ±100 ms autour de l'instant attendu
+  maxLag: 4096, // retard recherché : ±85 ms autour de l'instant attendu
 };
 const SIG_K0 = Math.ceil((SIG.f0 * SIG.fftSize) / SIG.rate);
 const SIG_K1 = Math.floor((SIG.f1 * SIG.fftSize) / SIG.rate);
