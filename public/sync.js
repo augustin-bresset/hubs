@@ -29,3 +29,16 @@ export function fitClock(samples) {
 
 export const localToServer = (clock, local) => local + clock.a + clock.b * (local - clock.t0);
 export const serverToLocal = (clock, server) => (server - clock.a + clock.b * clock.t0) / (1 + clock.b);
+
+// Corrections de compensation à partir des retards mesurés en continu. Seuls les écarts entre
+// appareils comptent (le trajet du micro décale toutes les mesures du même montant) : chaque
+// appareil est ramené vers la moyenne du groupe, par petits pas.
+// residuals : [{ client, ms }] des appareils détectés. Renvoie [{ client, deltaMs }].
+export function gapCorrections(residuals, { gain = 0.6, deadbandMs = 0.5, maxStepMs = 15 } = {}) {
+  if (residuals.length < 2) return [];
+  const mean = residuals.reduce((sum, r) => sum + r.ms, 0) / residuals.length;
+  return residuals
+    .map((r) => ({ client: r.client, gap: r.ms - mean }))
+    .filter((r) => Math.abs(r.gap) >= deadbandMs)
+    .map((r) => ({ client: r.client, deltaMs: Math.max(-maxStepMs, Math.min(maxStepMs, gain * r.gap)) }));
+}
