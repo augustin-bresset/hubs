@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 const PORT = 18180, TLS_PORT = 18543, IDP_PORT = 18181;
 const BASE = `http://localhost:${PORT}`;
 const CLIENT_ID = 'client-de-test', CLIENT_SECRET = 'secret-de-test';
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-server-'));
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hubs-server-'));
 const b64url = (data) => Buffer.from(data).toString('base64url');
 
 // --- Faux fournisseur : signe des jetons d'identité avec sa clé, publie la clé publique ---

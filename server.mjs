@@ -213,7 +213,7 @@ function ensureCert() {
     fs.mkdirSync(CERT_DIR, { recursive: true });
     execFileSync('openssl', [
       'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '365',
-      '-keyout', key, '-out', cert, '-subj', '/CN=sync-prototype',
+      '-keyout', key, '-out', cert, '-subj', '/CN=hubs',
       '-addext', `subjectAltName=DNS:localhost,${ips.map((ip) => `IP:${ip}`).join(',')}`,
     ], { stdio: 'ignore' });
     fs.writeFileSync(stamp, wanted);

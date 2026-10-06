@@ -31,8 +31,8 @@ const ROOM = (location.pathname.split('/')[2] ?? '').toUpperCase();
 const API = `/api/rooms/${ROOM}`;
 
 const S = {
-  id: sessionStorage.getItem('sync.id') || Math.random().toString(36).slice(2, 10),
-  name: localStorage.getItem('sync.name') || `${isMobile ? 'Téléphone' : 'Ordi'} ${Math.floor(Math.random() * 90 + 10)}`,
+  id: sessionStorage.getItem('hubs.id') || Math.random().toString(36).slice(2, 10),
+  name: localStorage.getItem('hubs.name') || `${isMobile ? 'Téléphone' : 'Ordi'} ${Math.floor(Math.random() * 90 + 10)}`,
   ready: false,
   connected: false,
   ctx: null,
@@ -78,12 +78,12 @@ const S = {
   trackCenterMs: 0, // décalage commun (trajet du micro) autour duquel chercher les signatures
   lastTrack: null,
 };
-sessionStorage.setItem('sync.id', S.id);
+sessionStorage.setItem('hubs.id', S.id);
 
 function log(...parts) {
   const line = `${new Date().toLocaleTimeString()}  ${parts.join(' ')}`;
   $('log').textContent = `${line}\n${$('log').textContent}`.slice(0, 8000);
-  console.log('[sync]', ...parts);
+  console.log('[hubs]', ...parts);
 }
 
 async function cmd(type, extra = {}) {
@@ -518,7 +518,7 @@ function driftTick() {
 function setLatency(ms, source) {
   S.latencyMs = Math.max(-200, Math.min(2000, Math.round(ms * 10) / 10));
   S.latencySource = source;
-  sessionStorage.setItem('sync.latency', JSON.stringify({ ms: S.latencyMs, source }));
+  sessionStorage.setItem('hubs.latency', JSON.stringify({ ms: S.latencyMs, source }));
   reportStatus();
   render();
 }
@@ -1174,7 +1174,7 @@ async function join() {
   $('join').disabled = true;
   $('join').textContent = 'Activation du son…';
   S.name = $('name').value.trim() || S.name;
-  localStorage.setItem('sync.name', S.name);
+  localStorage.setItem('hubs.name', S.name);
 
   const ctx = new AudioContext({ latencyHint: 'interactive' });
   await ctx.resume();
@@ -1214,7 +1214,7 @@ async function join() {
   setInterval(driftTick, 500);
   setInterval(reportStatus, 2000);
 
-  const saved = JSON.parse(sessionStorage.getItem('sync.latency') || 'null');
+  const saved = JSON.parse(sessionStorage.getItem('hubs.latency') || 'null');
   // Sans calibration, on part de l'estimation du navigateur (souvent fausse en Bluetooth).
   if (saved) setLatency(saved.ms, saved.source);
   else setLatency((ctx.outputLatency || 0) * 1000, 'navigateur');
@@ -1309,4 +1309,4 @@ async function start() {
 start();
 
 // Pour les tests et le débogage depuis la console.
-window.sync = { S, serverNow };
+window.hubs = { S, serverNow };

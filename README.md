@@ -1,4 +1,4 @@
-# Unisson — bêta
+# Hubs — bêta
 
 Lecture audio synchronisée sur plusieurs appareils (ordinateur, téléphones), chacun sur sa propre
 sortie son — haut-parleur intégré ou enceinte Bluetooth — avec calibration de la latence au micro.

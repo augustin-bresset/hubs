@@ -10,8 +10,8 @@ import puppeteer from 'puppeteer-core';
 
 const HTTP_PORT = 18080, HTTPS_PORT = 18443;
 // KEEP_CAPTURES=dossier garde les enregistrements du micro, pour essayer tools/analyze-capture.mjs.
-const CAPTURE_DIR = process.env.KEEP_CAPTURES ?? fs.mkdtempSync(path.join(os.tmpdir(), 'sync-captures-'));
-const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-data-'));
+const CAPTURE_DIR = process.env.KEEP_CAPTURES ?? fs.mkdtempSync(path.join(os.tmpdir(), 'hubs-captures-'));
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hubs-data-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Clic déclenché dans la page : le clic « souris » de puppeteer attend un rendu qui n'arrive jamais dans un onglet en arrière-plan.
 const click = (page, selector) => page.$eval(selector, (el) => el.click());
@@ -72,7 +72,7 @@ try {
   const state = async (page) => {
     const errs = [];
     for (let i = 0; i < 5; i++) {
-      errs.push(await page.evaluate(() => window.sync.S.errMs));
+      errs.push(await page.evaluate(() => window.hubs.S.errMs));
       await sleep(300);
     }
     const snapshot = await snapshotOf(page);
@@ -81,7 +81,7 @@ try {
   };
   // Passage par du JSON : le pilotage de Firefox tronque les objets imbriqués.
   const snapshotOf = async (page) => JSON.parse(await page.evaluate(() => {
-    const { S } = window.sync;
+    const { S } = window.hubs;
     return JSON.stringify({ id: S.id, rtt: S.clock.rtt, errMs: S.errMs, playing: !!S.play, latencyMs: S.latencyMs, lastCalib: S.lastCalib, clients: S.clients.length, probes: S.history.filter((h) => h.mode === 'probe'), testing: S.testing, tracks: S.history.filter((h) => h.mode === 'track'), notch: S.notchKey, wait: S.trackWait, live: !!S.live?.on, ringEnd: S.play?.ring?.end ?? 0, late: !!S.play?.late });
   }));
 
