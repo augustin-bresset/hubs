@@ -288,11 +288,14 @@ class SyncedStream {
   push({ n, t, channels, pcm }) {
     const len = pcm.length / channels;
     const left = new Float32Array(len), right = new Float32Array(len), mono = new Float32Array(len);
+    let peak = 0;
     for (let i = 0; i < len; i++) {
       left[i] = pcm[i * channels] / 32768;
       right[i] = channels === 2 ? pcm[i * 2 + 1] / 32768 : left[i];
       mono[i] = (left[i] + right[i]) / 2;
+      peak = Math.max(peak, Math.abs(left[i]), Math.abs(right[i]));
     }
+    this.peak = peak;
     this.ring.write(n, mono);
     this.node.port.postMessage({ type: 'data', n, left, right }, [left.buffer, right.buffer]);
     this.points.push({ n, t });
@@ -360,6 +363,7 @@ function stopSource() {
 function applyLive() {
   const live = S.live;
   if (!S.ready || !live?.on) {
+    if (S.hosting?.app) S.hosting = null; // la capture, faite par le serveur, s'est arrêtée avec le direct
     if (S.play instanceof SyncedStream) stopSource();
     return;
   }
@@ -390,29 +394,58 @@ async function listenLive(live) {
   }
 }
 
+// Le navigateur de cette page rejoue le direct : le capter comme une application bouclerait.
+const OWN_BROWSER = /Firefox/.test(navigator.userAgent) ? /firefox/i : /chrom|edge|brave|opera|vivaldi/i;
+const liveSources = { apps: [], devices: [], picked: false };
+
 // Sources que l'hôte peut diffuser. La liste de base s'affiche tout de suite ; les entrées audio s'y
 // ajoutent quand le navigateur veut bien les donner : leurs noms ne sont lisibles qu'une fois l'accès
-// accordé, et Firefox ne répond pas tant que l'onglet n'est pas au premier plan.
+// accordé, et Firefox ne répond pas tant que l'onglet n'est pas au premier plan. Sur l'ordinateur
+// qui héberge le serveur s'y ajoutent les applications en train de jouer (Spotify, lecteur vidéo…),
+// que le serveur capte lui-même.
 function refreshLiveSources() {
   const select = $('liveSource');
-  const fill = (devices) => {
-    const options = [['default', 'Entrée audio par défaut']];
-    for (const d of devices) if (d.kind === 'audioinput' && d.label && d.deviceId !== 'default') options.push([d.deviceId, d.label]);
+  const fill = (found) => {
+    Object.assign(liveSources, found);
+    const options = [...liveSources.apps.map((name) => [`app:${name}`, `Application : ${name}`]), ['default', 'Entrée audio par défaut']];
+    for (const d of liveSources.devices) if (d.kind === 'audioinput' && d.label && d.deviceId !== 'default') options.push([d.deviceId, d.label]);
     if (navigator.mediaDevices?.getDisplayMedia) options.push(['display', "Son d'un onglet ou de l'écran"]);
     if (LOOPBACK) options.push(['test', 'Bruit de test']);
+    if (select.dataset.key === JSON.stringify(options)) return;
+    select.dataset.key = JSON.stringify(options);
     const before = select.value;
     select.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
-    if (options.some(([value]) => value === before)) select.value = before;
+    // Tant que l'hôte n'a rien choisi, une application passe avant le micro : c'est elle qu'on veut
+    // diffuser, alors que le micro renverrait le son de la pièce dans les enceintes.
+    const keep = options.some(([value]) => value === before) && (before !== 'default' || liveSources.picked);
+    select.value = keep ? before : options[0][0];
   };
-  if (!select.options.length) fill([]);
-  navigator.mediaDevices?.enumerateDevices?.().then(fill, () => {});
+  if (!select.options.length) fill({});
+  navigator.mediaDevices?.enumerateDevices?.().then((devices) => fill({ devices }), () => {});
+  if (isLocal && S.isOwner) {
+    fetch(`${API}/live/apps`).then((r) => r.json()).then((d) => fill({ apps: (d.apps ?? []).filter((name) => !OWN_BROWSER.test(name)) }), () => {});
+  }
 }
 
 const RAW_AUDIO = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
 
+const requestLive = async (body) => (await fetch(`${API}/live/start`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ id: S.id, delayMs: Number($('liveDelay').value), ...body }),
+})).json();
+
 // Hôte : capte la source choisie et l'envoie par tranches au serveur.
 async function startLive() {
   const ctx = S.ctx, kind = $('liveSource').value;
+  if (kind.startsWith('app:')) {
+    // Le serveur capte lui-même l'application : cette page n'a rien à envoyer.
+    const app = kind.slice(4);
+    const started = await requestLive({ app });
+    if (!started.ok) throw new Error(started.error ?? 'refusé par le serveur');
+    S.hosting = { app };
+    return;
+  }
   let stream = null, source;
   if (kind === 'test') {
     const noise = ctx.createBuffer(2, 4 * ctx.sampleRate, ctx.sampleRate);
@@ -434,11 +467,7 @@ async function startLive() {
     source = ctx.createMediaStreamSource(stream);
   }
 
-  const started = await (await fetch(`${API}/live/start`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: S.id, sampleRate: ctx.sampleRate, channels: 2, delayMs: Number($('liveDelay').value) }),
-  })).json();
+  const started = await requestLive({ sampleRate: ctx.sampleRate, channels: 2 });
   if (!started.ok) {
     stream?.getTracks().forEach((t) => t.stop());
     throw new Error(started.error ?? 'refusé par le serveur');
@@ -483,7 +512,7 @@ async function sendLiveQueue(hosting) {
 async function stopLive() {
   const hosting = S.hosting;
   S.hosting = null;
-  if (hosting) {
+  if (hosting?.node) {
     hosting.node.port.postMessage({ on: false });
     hosting.source.disconnect();
     hosting.node.disconnect();
@@ -1084,7 +1113,13 @@ function renderLive() {
   if (live) {
     const host = S.clients.find((c) => c.id === live.hostId)?.name ?? '?';
     info = `En direct depuis ${host}, entendu ${fmt(live.delayMs / 1000)} s après la source.`;
-    if (S.hosting) info += S.hosting.peak < 0.001 ? ' Aucun son capté pour l’instant : vérifie la source choisie.' : ` Niveau capté : ${fmt(20 * Math.log10(S.hosting.peak), 0)} dB.`;
+    if (S.hosting) {
+      // Application captée par le serveur : le niveau se lit sur le flux reçu en retour.
+      const app = S.hosting.app, peak = (app ? S.play?.peak : S.hosting.peak) ?? 0;
+      info += peak >= 0.001 ? ` Niveau capté : ${fmt(20 * Math.log10(peak), 0)} dB.`
+        : app ? ` Aucun son ne vient de ${app} pour l’instant : lance la lecture dans l’application.`
+          : ' Aucun son capté pour l’instant : vérifie la source choisie.';
+    }
     if (S.play?.late) info += ' Le son arrive trop tard sur cet appareil : relance le direct avec un retard plus grand.';
   }
   $('liveInfo').textContent = info || S.liveError;
@@ -1256,6 +1291,9 @@ $('tracking').onclick = async () => {
   return cmd('tracking', { on: true });
 };
 $('releaseMic').onclick = releaseMic;
+$('liveSource').onchange = () => { liveSources.picked = true; };
+// Une application lancée entre-temps apparaît dans les sources du direct au retour sur la page.
+window.addEventListener('focus', () => S.ready && refreshLiveSources());
 $('liveToggle').onclick = async () => {
   S.liveError = '';
   try {

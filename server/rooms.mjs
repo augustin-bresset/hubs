@@ -21,8 +21,8 @@ function send(res, event, data) {
 }
 
 class Room {
-  constructor(meta, { now, captureDir }) {
-    Object.assign(this, { meta, now, captureDir });
+  constructor(meta, { now, captureDir, captureApp }) {
+    Object.assign(this, { meta, now, captureDir, captureApp });
     this.clients = new Map(); // id -> { id, name, ready, status, slot, res }
     this.history = []; // résultats de calibration et de suivi, du plus ancien au plus récent
     // Suivi continu : chaque appareil a sa bande réservée dans la musique, celui qui écoute y mesure son retard.
@@ -32,6 +32,7 @@ class Room {
     this.playback = { track: 'metronome', playing: false, S0: 0, P0: 0 };
     // Direct : l'hôte capte un son et l'envoie par tranches, relayées telles quelles aux appareils.
     this.live = { on: false };
+    this.liveSource = null; // capture faite par le serveur lui-même (son d'une application), à arrêter avec le direct
     this.liveBacklog = [];
     this.liveListeners = new Set();
     this.clientsTimer = null;
@@ -85,11 +86,14 @@ class Room {
   }
 
   // Démarre un direct. sampleRate et channels décrivent le son que l'hôte va envoyer ; delayMs est
-  // le retard entre la capture et l'écoute, commun à tous les appareils.
-  startLive({ id, sampleRate, channels, delayMs }) {
+  // le retard entre la capture et l'écoute, commun à tous les appareils. source : la capture du
+  // serveur, quand ce n'est pas la page de l'hôte qui envoie le son.
+  startLive({ id, sampleRate, channels, delayMs }, source = null) {
     if (!this.clients.get(id)?.ready) return { ok: false, error: "l'appareil qui diffuse n'a pas rejoint" };
     if (!(sampleRate >= 8000 && sampleRate <= 96000) || ![1, 2].includes(channels)) return { ok: false, error: 'format de son refusé' };
     if (this.playback.playing) this.setPlayback({ playing: false, P0: this.currentPos() });
+    this.liveSource?.stop(); // un direct en remplace un autre
+    this.liveSource = source;
     this.liveBacklog = [];
     this.live = { on: true, id: crypto.randomUUID(), hostId: id, sampleRate, channels, delayMs: Math.max(300, Math.min(5000, Number(delayMs) || 1000)) };
     this.log(`direct lancé par ${this.clients.get(id).name} (${sampleRate} Hz, ${channels} canal(aux), retard ${this.live.delayMs} ms)`);
@@ -97,8 +101,25 @@ class Room {
     return { ok: true, live: this.live };
   }
 
+  // Direct dont la source est une application de l'ordinateur qui héberge le serveur : c'est lui
+  // qui capte, la page de l'hôte n'envoie rien.
+  startAppLive({ id, app, delayMs }) {
+    if (!this.clients.get(id)?.ready) return { ok: false, error: "l'appareil qui diffuse n'a pas rejoint" };
+    this.stopLive(); // libère la capture d'un direct précédent avant d'en ouvrir une
+    let source;
+    try {
+      source = this.captureApp(String(app), { now: this.now, onFrame: (frame) => this.pushLive(frame), onEnd: () => this.stopLive() });
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+    this.log(`capture de l'application ${app}`);
+    return this.startLive({ id, ...source.format, delayMs }, source);
+  }
+
   stopLive() {
     if (!this.live.on) return { ok: true };
+    this.liveSource?.stop();
+    this.liveSource = null;
     this.live = { on: false };
     this.liveBacklog = [];
     for (const res of this.liveListeners) res.end();
@@ -270,7 +291,7 @@ class Room {
   }
 }
 
-export function createRooms({ dataDir, now, captureDir }) {
+export function createRooms({ dataDir, now, captureDir, captureApp }) {
   const file = path.join(dataDir, 'rooms.json');
   const metas = new Map(fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).map((m) => [m.code, m]) : []);
   const live = new Map(); // code -> Room
@@ -311,7 +332,7 @@ export function createRooms({ dataDir, now, captureDir }) {
     open(code) {
       const meta = metas.get(code);
       if (!meta) return null;
-      if (!live.has(code)) live.set(code, new Room(meta, { now, captureDir }));
+      if (!live.has(code)) live.set(code, new Room(meta, { now, captureDir, captureApp }));
       return live.get(code);
     },
   };

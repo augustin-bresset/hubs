@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createAuth, isLoopback } from './server/auth.mjs';
 import { createRooms } from './server/rooms.mjs';
+import { captureApp, listApps, stopAppCapture } from './server/app-audio.mjs';
 import { BRAND } from './public/brand.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -39,7 +40,7 @@ const now = () => performance.now();
 const BOOT = randomUUID(); // l'horloge repart de zéro à chaque démarrage : les pages doivent le savoir
 
 const auth = createAuth({ dataDir: DATA_DIR, publicUrl: PUBLIC_URL });
-const rooms = createRooms({ dataDir: DATA_DIR, now, captureDir: CAPTURE_DIR });
+const rooms = createRooms({ dataDir: DATA_DIR, now, captureDir: CAPTURE_DIR, captureApp });
 
 // --- HTTP -------------------------------------------------------------------
 
@@ -85,6 +86,10 @@ function serveStatic(res, pathname) {
   if (!file.startsWith(PUBLIC + path.sep)) return json(res, 403, { ok: false });
   serveFile(res, file);
 }
+
+// Ce qui touche à l'ordinateur du serveur (le son de ses applications) n'est offert qu'à une page
+// ouverte sur cet ordinateur même, pas à travers un mandataire qui tournerait à côté.
+const onThisMachine = (req) => isLoopback(req) && !req.headers['x-forwarded-for'];
 
 // Une action faite avec le cookie de session doit venir de nos propres pages.
 function sameOrigin(req) {
@@ -135,9 +140,16 @@ async function handleRoom(req, res, url, code, rest) {
     if (!room.live.on) return json(res, 404, { ok: false, error: 'aucun direct en cours' });
     return room.listenLive(req, res);
   }
+  // Applications de cet ordinateur que le serveur peut capter lui-même pour le direct.
+  if (rest === '/live/apps' && req.method === 'GET') return json(res, 200, { ok: true, apps: isOwner && onThisMachine(req) ? await listApps() : [] });
   if (rest.startsWith('/live/') && req.method === 'POST') {
     if (!isOwner || !sameOrigin(req)) return json(res, 403, { ok: false, error: 'seul le créateur de la salle peut diffuser' });
-    if (rest === '/live/start') return json(res, 200, room.startLive(await readJson(req)));
+    if (rest === '/live/start') {
+      const msg = await readJson(req);
+      if (msg.app === undefined) return json(res, 200, room.startLive(msg));
+      if (!onThisMachine(req)) return json(res, 403, { ok: false, error: "le son d'une application ne se diffuse que depuis l'ordinateur du serveur" });
+      return json(res, 200, room.startAppLive(msg));
+    }
     if (rest === '/live/stop') return json(res, 200, room.stopLive());
     if (rest === '/live/chunk') return json(res, 200, { ok: room.pushLive(await readBody(req, 1024 * 1024)) });
   }
@@ -219,6 +231,14 @@ function ensureCert() {
     fs.writeFileSync(stamp, wanted);
   }
   return { key: fs.readFileSync(key), cert: fs.readFileSync(cert) };
+}
+
+// Un direct qui capte une application l'a déplacée sur une sortie virtuelle : la lui rendre en partant.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    stopAppCapture();
+    process.exit(0);
+  });
 }
 
 http.createServer(listener).listen(HTTP_PORT, () => {

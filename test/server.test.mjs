@@ -202,6 +202,18 @@ test('direct : réservé au créateur, relayé tel quel, avec rattrapage pour qu
   // L'arrêt ferme les flux ; le départ de l'hôte arrête un direct en cours.
   assert.equal((await (await post(`/api/rooms/${code}/live/stop`, {}, session)).json()).ok, true);
   assert.equal((await reader.read()).done, true);
+
+  // Son d'une application de l'ordinateur du serveur : au créateur seulement, et pas à travers un mandataire.
+  const proxied = { 'X-Forwarded-For': '203.0.113.7' };
+  assert.deepEqual((await (await get(`/api/rooms/${code}/live/apps`)).json()).apps, [], 'un invité ne voit pas les applications');
+  assert.deepEqual((await (await fetch(`${BASE}/api/rooms/${code}/live/apps`, { headers: { Cookie: session, ...proxied } })).json()).apps, []);
+  assert.ok(Array.isArray((await (await get(`/api/rooms/${code}/live/apps`, session)).json()).apps));
+  const app = { id: 'hote', app: 'application-qui-n-existe-pas', delayMs: 1000 };
+  assert.equal((await post(`/api/rooms/${code}/live/start`, app)).status, 403);
+  assert.equal((await post(`/api/rooms/${code}/live/start`, app, session, proxied)).status, 403);
+  const absent = await (await post(`/api/rooms/${code}/live/start`, app, session)).json();
+  assert.equal(absent.ok, false, `application introuvable (${absent.error})`);
+  assert.equal((await get(`/api/rooms/${code}/live/stream`)).status, 404, 'aucun direct lancé');
   await post(`/api/rooms/${code}/live/start`, format, session);
   await events.body.cancel();
   await new Promise((r) => setTimeout(r, 300));
