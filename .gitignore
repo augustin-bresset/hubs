@@ -3,3 +3,6 @@ node_modules/
 captures/
 .ff-profile/
 data/
+android/build/
+android/.keystore
+public/hubs.apk

@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, X509Certificate } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createAuth, isLoopback } from './server/auth.mjs';
 import { createRooms } from './server/rooms.mjs';
@@ -32,6 +32,7 @@ const MIME = {
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.apk': 'application/vnd.android.package-archive',
 };
 // Tout le code vient du serveur lui-même ; les images distantes servent aux photos de profil.
 const CSP = "default-src 'self'; img-src 'self' https: data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
@@ -242,10 +243,13 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
 }
 
 http.createServer(listener).listen(HTTP_PORT, () => {
-  https.createServer(ensureCert(), listener).listen(HTTPS_PORT, () => {
+  const tls = ensureCert();
+  https.createServer(tls, listener).listen(HTTPS_PORT, () => {
     console.log(`${BRAND} prêt.`);
     console.log(`  Sur cet ordinateur : http://localhost:${HTTP_PORT}`);
     for (const ip of lanAddresses()) console.log(`  Sur le réseau local : https://${ip}:${HTTPS_PORT}  (accepter l'avertissement de certificat)`);
+    // L'application Android montre cette empreinte avant de faire confiance au serveur.
+    console.log(`  Empreinte du certificat : ${new X509Certificate(tls.cert).fingerprint256}`);
     console.log(auth.googleEnabled ? `  Connexion Google active, retour sur ${PUBLIC_URL}/auth/callback` : '  Connexion Google non configurée : connexion de développement, depuis cet ordinateur seulement.');
   });
 });

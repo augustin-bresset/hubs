@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Le nom de l'application (app_name) vient de public/brand.js : build.sh l'écrit à la construction. -->
+<resources>
+    <string name="start_hint">Adresse affichée par le serveur, ou lien de la salle. Le téléphone doit être sur le même Wi-Fi.</string>
+    <string name="address_hint">192.168.1.12:8443</string>
+    <string name="open">Ouvrir</string>
+    <string name="unreachable">Serveur injoignable (%1$s). Vérifie l\'adresse et le Wi-Fi.</string>
+    <string name="page_crashed">La page s\'est arrêtée. Rouvre la salle.</string>
+    <string name="cert_title">Faire confiance à ce serveur ?</string>
+    <string name="cert_message">%1$s présente un certificat que le téléphone ne connaît pas, ce qui est normal pour un serveur lancé sur ton ordinateur.\n\nEmpreinte, à comparer avec celle affichée au démarrage du serveur :\n%2$s</string>
+    <string name="cert_trust">Faire confiance</string>
+    <string name="cert_refused">Certificat refusé : la salle n\'a pas été ouverte.</string>
+    <string name="cancel">Annuler</string>
+    <string name="channel">Lecture en cours</string>
+    <string name="notification_text">Le son continue écran éteint.</string>
+    <string name="stop">Arrêter</string>
+</resources>

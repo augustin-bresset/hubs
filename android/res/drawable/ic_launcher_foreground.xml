@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Un point central et deux ondes de part et d'autre : plusieurs enceintes, un même son. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#0d1f1a" android:pathData="M54,54m-7,0a7,7 0,1 1,14 0a7,7 0,1 1,-14 0" />
+    <path android:strokeColor="#0d1f1a" android:strokeWidth="5" android:strokeLineCap="round" android:fillColor="#00000000"
+        android:pathData="M66,42a17,17 0,0 1,0 24" />
+    <path android:strokeColor="#0d1f1a" android:strokeWidth="5" android:strokeLineCap="round" android:fillColor="#00000000"
+        android:pathData="M42,42a17,17 0,0 0,0 24" />
+    <path android:strokeColor="#0d1f1a" android:strokeWidth="5" android:strokeLineCap="round" android:fillColor="#00000000"
+        android:pathData="M75,34a29,29 0,0 1,0 40" />
+    <path android:strokeColor="#0d1f1a" android:strokeWidth="5" android:strokeLineCap="round" android:fillColor="#00000000"
+        android:pathData="M33,34a29,29 0,0 0,0 40" />
+</vector>
