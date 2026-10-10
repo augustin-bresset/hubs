@@ -1,8 +1,15 @@
+# Dépendances (seulement pour les tests de bout en bout)
 node_modules/
+
+# Créés par le serveur : certificat, comptes et salles, enregistrements du micro
 .cert/
-captures/
-.ff-profile/
 data/
+captures/
+
+# Profil du navigateur des tests sous Firefox
+.ff-profile/
+
+# Application Android : sorties de construction et clé de signature
 android/build/
 android/.keystore
 public/hubs.apk

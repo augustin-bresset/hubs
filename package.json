@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Bêta : lecture audio synchronisée sur plusieurs appareils, avec calibration au micro",
+  "description": "Lecture audio synchronisée sur plusieurs appareils, avec mesure de la latence au micro",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test test/dsp.test.mjs test/sync.test.mjs test/music.test.mjs test/live.test.mjs test/app-audio.test.mjs test/server.test.mjs",
