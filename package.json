@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Lecture audio synchronisée sur plusieurs appareils, avec mesure de la latence au micro",
+  "license": "AGPL-3.0-only",
   "engines": {
     "node": ">=18"
   },

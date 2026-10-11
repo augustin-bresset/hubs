@@ -2,7 +2,7 @@
 
 > **In short** — Play the same music, in sync, on several devices (a computer, phones), each on its own
 > speaker, Bluetooth included. Hubs uses a microphone to measure what is actually heard, compensates each
-> device's latency, then keeps tracking the gap while the music plays. Prototype; documentation in French.
+> device's latency, then keeps tracking the gap while the music plays. Prototype, AGPL-3.0; documentation in French.
 
 Lecture audio synchronisée sur plusieurs appareils — ordinateur, téléphones — chacun sur sa propre
 sortie son : haut-parleur intégré ou enceinte Bluetooth.
@@ -237,3 +237,12 @@ et suivi en boucle interne, capture d'une application remplacée par une fausse.
 Pendant le suivi, l'appareil qui écoute envoie au serveur ce que son micro entend (s'il tourne sur la
 même machine). Les douze dernières fenêtres et le morceau joué sont gardés dans `captures/CODE/` ;
 `node tools/analyze-capture.mjs` rejoue la mesure dessus (nécessite `ffmpeg`).
+
+## Licence
+
+Hubs est distribué sous la [licence publique générale GNU Affero, version 3](LICENSE) (AGPL-3.0).
+Chacun peut l'utiliser, le modifier et le redistribuer. Une version modifiée doit rester sous la même
+licence, avec son code source, y compris quand elle est seulement proposée comme service en ligne.
+Le logiciel est fourni sans aucune garantie.
+
+Copyright © 2026 Augustin Bresset
