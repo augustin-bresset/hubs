@@ -197,12 +197,12 @@ class Room {
     const parts = entry.results.map((r) => {
       const value = r.detected ? `${fmt(r.ms)}ms` : 'non détecté';
       const detail = entry.mode === 'track'
-        ? `score ${fmt(r.psr)}, niveau ${r.levelDb == null ? '–' : `${Math.round(r.levelDb)} dB`}${r.windows > 1 ? `, cumul ${r.windows}` : ''}`
+        ? `score ${fmt(r.psr)}, niveau ${r.levelDb == null ? '–' : `${Math.round(r.levelDb)} dB`}${r.windows > 1 ? `, cumul ${r.windows}` : ''}${r.wide ? ', recherche élargie' : ''}`
         : `dispersion ${fmt(r.spreadMs)}, ${r.hits}/${r.reps}, score ${Math.round(Math.min(r.psr, 999))}`;
       return `${r.name}=${value} (${detail}, comp ${fmt(r.compMs)})`;
     });
     const fixes = entry.mode === 'track' && entry.corrections.length
-      ? `  corrections : ${entry.corrections.map((c) => `${nameOf(c.client)} ${signed(c.deltaMs)}ms`).join(', ')}`
+      ? `  corrections : ${entry.corrections.map((c) => `${nameOf(c.client)} ${signed(c.deltaMs)}ms${c.jump ? ' (rattrapage)' : ''}`).join(', ')}`
       : '';
     this.log(`${entry.mode.padEnd(7)} ${parts.join('  ')}${fixes}`);
     this.broadcast('calibResult', entry);

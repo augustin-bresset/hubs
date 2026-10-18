@@ -59,8 +59,10 @@ node server.mjs
 - Les boutons ± ms ajustent chaque appareil à l'oreille, y compris à distance.
 - **Test de stabilité** : dix mesures à la suite, sans toucher à la compensation. Le résumé donne la
   variation de l'écart entre appareils ; c'est elle qui dit si une calibration unique suffit.
-- **Suivi continu** (après une calibration, pendant que la musique joue) : l'appareil qui écoute
-  mesure l'écart entre appareils toutes les 6 à 10 s dans la musique elle-même et le corrige.
+- **Suivi continu** (pendant que la musique joue) : l'appareil qui écoute mesure l'écart entre
+  appareils toutes les 6 à 10 s dans la musique elle-même et le corrige. Il retrouve aussi un
+  appareil pas encore calibré, ou dont l'enceinte a changé, jusqu'à 0,7 s des autres, et le
+  rattrape d'un coup ; la calibration reste plus rapide et plus sûre pour démarrer.
 
 Chaque mesure est gardée dans l'historique de la page et écrite dans la sortie du serveur.
 
@@ -151,6 +153,12 @@ flowchart LR
   mieux reconnu sert de référence ; l'écart des autres vient du cumul de leurs six dernières
   fenêtres, recalées sur lui. Les corrections sont prudentes : rien sous 2 ms d'écart, 6 ms au plus
   par pas. Quatre appareils au plus.
+- **Recherche élargie** : une analyse ne couvre que ±85 ms. Un appareil que le micro entend dans sa
+  bande sans le trouver près de la référence est cherché dans la même fenêtre, décalée par pas de
+  120 ms jusqu'à ±0,7 s. Une musique rythmée donne de faux pics à une mesure d'écart : il faut un
+  score de 12 sur une fenêtre, de 10 sur deux ou de 8 sur trois cumulées (rejouées contre une
+  musique décalée, les captures réelles ne dépassent pas 6,7, 5,9 et 5,3). Un appareil retrouvé à
+  plus de 40 ms des autres est rattrapé d'un coup.
 - **Direct** : l'hôte découpe le son capté en tranches de 100 ms, chacune datée de l'heure commune
   de sa capture. Une droite ajustée sur ces dates donne le rythme réel de sa carte son ; chaque
   appareil lit le flux avec un lecteur à vitesse variable asservi à cette horloge, pour faire
@@ -191,7 +199,7 @@ mesure sur 205. Le reste est validé par des tests automatiques, en simulation e
 
 - La synchro n'est exacte qu'à l'emplacement du micro (le son parcourt environ 3 ms par mètre).
 - Le suivi continu ne mesure que quand la musique joue et contient de l'énergie entre 3 et 7 kHz. Il
-  ne cherche un appareil qu'à ±80 ms de celui qu'il a déjà trouvé : il faut calibrer d'abord.
+  cherche un appareil jusqu'à 0,7 s des autres : au-delà, il faut calibrer.
 - Pendant le suivi, chaque appareil joue la musique avec une bande étroite en moins.
 - Sous Firefox, la position de lecture flotte d'environ ±1 ms.
 - Le trajet du micro ajoute à toutes les mesures un décalage commun qui dérive : seules les valeurs
@@ -236,7 +244,8 @@ et suivi en boucle interne, capture d'une application remplacée par une fausse.
 
 Pendant le suivi, l'appareil qui écoute envoie au serveur ce que son micro entend (s'il tourne sur la
 même machine). Les douze dernières fenêtres et le morceau joué sont gardés dans `captures/CODE/` ;
-`node tools/analyze-capture.mjs` rejoue la mesure dessus (nécessite `ffmpeg`).
+`node tools/analyze-capture.mjs` rejoue la mesure dessus, recherche élargie comprise (nécessite
+`ffmpeg`).
 
 ## Licence
 

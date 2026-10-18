@@ -359,54 +359,100 @@ export class MusicAnalyzer {
   }
 }
 
+// Recherche élargie. Un appareil pas encore calibré (ou dont l'enceinte Bluetooth a changé) peut
+// arriver à des centaines de ms des autres, hors de la plage d'une analyse (±85 ms). Quand le micro
+// l'entend dans sa bande sans le trouver, la même fenêtre est analysée de nouveau, décalée de
+// chacun de ces écarts, pour sa seule bande. Une musique rythmée fait apparaître de faux pics à
+// une mesure d'écart (environ 0,5 s) : on cumule donc plusieurs fenêtres avant de conclure, sauf
+// arrivée très nette.
+export const WIDE = {
+  offsetsMs: [-600, -480, -360, -240, -120, 120, 240, 360, 480, 600], // plage couverte : ±685 ms
+  // Score exigé selon le nombre de fenêtres cumulées : 1, 2, puis 3 ou plus. Rejouées contre une
+  // musique décalée, les captures réelles plafonnent à 6,7, 5,9 et 5,3 ; les vrais appareils
+  // lointains y montent de 8 à 15.
+  scores: [12, 10, 8],
+  jumpMs: 40, // au-delà de cet écart, l'appareil est rattrapé d'un coup plutôt que par petits pas
+};
+
 // Additionne les profils de fenêtres successives, recalés sur le début de l'arrivée d'un appareil
-// de référence.
+// de référence. half : demi-largeur des profils (PROBE.maxLag, ou plus pour la recherche élargie).
 class ProfileStack {
-  constructor(depth) {
+  constructor(depth, half = PROBE.maxLag) {
     this.depth = depth;
+    this.half = half;
     this.items = [];
   }
 
-  // refK0 : indice du front de la référence dans cette fenêtre.
-  add(profile, refK0) {
-    this.items.push({ profile, shift: refK0 - PROBE.maxLag });
+  // refAt : indice, dans ce profil, du début de l'arrivée de la référence.
+  add(profile, refAt) {
+    this.items.push({ profile, shift: refAt - this.half });
     if (this.items.length > this.depth) this.items.shift();
   }
 
   // Retard par rapport à la référence (échantillons) et score, sur la somme des fenêtres.
   result(sampleRate) {
-    const n = 2 * PROBE.maxLag + 1;
+    const n = 2 * this.half + 1;
     const sum = new Float64Array(n);
     for (const { profile, shift } of this.items) {
       for (let i = Math.max(0, -shift); i < Math.min(n, n - shift); i++) sum[i] += profile[i + shift];
     }
     const onset = findOnset(sum, sampleRate);
-    return { lag: onset.at - PROBE.maxLag, score: onset.score, edge: onset.edge, count: this.items.length };
+    return { lag: onset.at - this.half, score: onset.score, edge: onset.edge, count: this.items.length };
   }
+}
+
+// Profil élargi d'un appareil, recollé à partir d'analyses de la même fenêtre décalées chacune de
+// `offset` échantillons : chaque retard est pris dans l'analyse dont le centre est le plus proche,
+// loin de ses bords. L'indice i correspond au retard i - half par rapport à l'analyse sans décalage.
+function stitch(passes, key, driftIndex, half) {
+  const out = new Float32Array(2 * half + 1).fill(1); // fond des profils normalisés
+  const sorted = [...passes].sort((p, q) => p.offset - q.offset);
+  sorted.forEach(({ offset, analyzer }, j) => {
+    const lo = j === 0 ? -Infinity : (sorted[j - 1].offset + offset) / 2;
+    const hi = j === sorted.length - 1 ? Infinity : (offset + sorted[j + 1].offset) / 2;
+    const profile = analyzer.profile(key, driftIndex);
+    for (let k = 0; k < profile.length; k++) {
+      const lag = k - PROBE.maxLag + offset;
+      if (lag >= lo && lag < hi && lag + half >= 0 && lag + half < out.length) out[lag + half] = profile[k];
+    }
+  });
+  return out;
 }
 
 // Décide, fenêtre après fenêtre, quels appareils sont reconnus et à quel retard. L'appareil le mieux
 // reconnu sert de référence. Pour chacun des autres, on cumule les profils des dernières fenêtres,
 // recalés sur la référence (le trajet du micro fait glisser tous les retards ensemble d'une fenêtre
 // à l'autre) : c'est ce cumul qui donne son écart, bien plus stable que la mesure d'une seule fenêtre
-// quand l'appareil est faible ou lointain.
+// quand l'appareil est faible ou lointain. Un appareil entendu mais introuvable près de la référence
+// est cherché plus loin (widen), avec ses propres cumuls.
 export class GapTracker {
   // scoreMin : score minimal d'un appareil ; refScoreMin : de la référence ; strongScore : score
   // au-delà duquel une seule fenêtre suffit ; minWindows : fenêtres à cumuler sinon.
-  constructor(sampleRate, { scoreMin = TRACKING.scoreMin, refScoreMin = TRACKING.refScoreMin, strongScore = 2 * scoreMin, levelMin = TRACKING.levelMin, minBlocks = TRACKING.blocks / 2, depth = 6, minWindows = 3 } = {}) {
-    Object.assign(this, { sampleRate, scoreMin, refScoreMin, strongScore, levelMin, minBlocks, depth, minWindows });
+  constructor(sampleRate, { scoreMin = TRACKING.scoreMin, refScoreMin = TRACKING.refScoreMin, strongScore = 2 * scoreMin, levelMin = TRACKING.levelMin, minBlocks = TRACKING.blocks / 2, depth = 6, minWindows = 3, wideScores = WIDE.scores } = {}) {
+    Object.assign(this, { sampleRate, scoreMin, refScoreMin, strongScore, levelMin, minBlocks, depth, minWindows, wideScores });
     this.stacks = new Map();
+    this.wide = new Map();
     this.refKey = null;
+    this.ref = null; // résultat de la référence dans la dernière fenêtre (lag, k0, driftIndex…)
   }
 
-  // À appeler quand les écarts ont pu changer : correction appliquée, lecture ou appareils modifiés.
+  // À appeler quand les écarts ont pu changer : lecture ou appareils modifiés, appareil rattrapé de loin.
   reset() {
     this.stacks.clear();
+    this.wide.clear();
     this.refKey = null;
+    this.ref = null;
+  }
+
+  // Après une petite correction (quelques ms) : les cumuls précis repartent de zéro, ceux de la
+  // recherche élargie, qui n'ont pas besoin de cette précision, sont gardés.
+  settle() {
+    this.stacks.clear();
   }
 
   // analyzer : MusicAnalyzer rempli pour une fenêtre. Renvoie Map clé -> { detected, lag
-  // (échantillons, par rapport à l'instant attendu), score, level, drift, windows }.
+  // (échantillons, par rapport à l'instant attendu), score, level, drift, windows, audible }.
+  // audible : pas reconnu, mais assez fort dans sa bande pour mériter une recherche élargie.
   update(analyzer) {
     const res = analyzer.results();
     const usable = (r) => r.blocks >= this.minBlocks && r.level >= this.levelMin;
@@ -417,13 +463,16 @@ export class GapTracker {
     // Les cumuls sont recalés sur l'appareil de référence : s'il change, ils ne valent plus rien.
     if (ref && refKey !== this.refKey) {
       this.stacks.clear();
+      this.wide.clear();
       this.refKey = refKey;
     }
+    this.ref = ref;
 
     const out = new Map();
     for (const [key, r] of res) {
-      const base = { score: r.score, level: r.level, drift: r.drift, windows: 1 };
+      const base = { score: r.score, level: r.level, drift: r.drift, windows: 1, audible: false };
       if (key === refKey) {
+        this.wide.delete(key);
         out.set(key, { ...base, detected: true, lag: r.lag });
         continue;
       }
@@ -436,10 +485,28 @@ export class GapTracker {
       stack.add(analyzer.profile(key, ref.driftIndex), ref.k0);
       const s = stack.result(this.sampleRate);
       const enough = s.count >= this.minWindows || (r.score >= this.strongScore && !r.edge);
-      out.set(key, enough && s.score >= this.scoreMin && !s.edge
-        ? { score: s.score, level: r.level, drift: ref.drift, windows: s.count, detected: true, lag: ref.lag + s.lag }
-        : { ...base, windows: s.count, detected: false, lag: null });
+      if (enough && s.score >= this.scoreMin && !s.edge) {
+        this.wide.delete(key);
+        out.set(key, { score: s.score, level: r.level, drift: ref.drift, windows: s.count, detected: true, lag: ref.lag + s.lag });
+      } else {
+        out.set(key, { ...base, windows: s.count, detected: false, lag: null, audible: true });
+      }
     }
     return out;
+  }
+
+  // Recherche élargie d'un appareil que update() a déclaré audible, après la même fenêtre. passes :
+  // [{ offset, analyzer }], analyses de cette fenêtre décalées de `offset` échantillons, dont
+  // l'analyse principale (offset 0). Renvoie { detected, lag (comme update), score, windows }.
+  widen(key, passes) {
+    const ref = this.ref;
+    if (!ref) return { detected: false, lag: null, score: 0, windows: 0 };
+    const half = PROBE.maxLag + Math.max(...passes.map((p) => Math.abs(p.offset)));
+    let stack = this.wide.get(key);
+    if (stack?.half !== half) this.wide.set(key, (stack = new ProfileStack(this.depth, half)));
+    stack.add(stitch(passes, key, ref.driftIndex, half), ref.k0 - PROBE.maxLag + half);
+    const s = stack.result(this.sampleRate);
+    const needed = this.wideScores[Math.min(s.count, this.wideScores.length) - 1];
+    return { detected: s.score >= needed && !s.edge, lag: ref.lag + s.lag, score: s.score, windows: s.count };
   }
 }

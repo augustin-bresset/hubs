@@ -1,4 +1,4 @@
-import { makeChirp, detectChirp, median, PROBE, TRACKING, makeBandstop, MusicAnalyzer, GapTracker } from './dsp.js';
+import { makeChirp, detectChirp, median, PROBE, TRACKING, WIDE, makeBandstop, MusicAnalyzer, GapTracker } from './dsp.js';
 import { fitClock, localToServer, serverToLocal, gapCorrections } from './sync.js';
 import { BRAND } from './brand.js';
 import { LIVE, encodeFrame, FrameParser, fitStreamClock, StreamRing } from './live.js';
@@ -799,7 +799,10 @@ async function trackingLoop() {
       }
       await cmd('calibResult', { result });
       uploadCapture(result).catch((err) => log('capture non envoyée :', err.message));
-      if (result.corrections.length) S.gapTracker.reset();
+      // Un appareil rattrapé de loin change toute la donne ; après de petits pas, seuls les cumuls
+      // précis repartent de zéro.
+      if (result.corrections.some((c) => c.jump)) S.gapTracker.reset();
+      else if (result.corrections.length) S.gapTracker.settle();
       notBefore = serverNow() + (result.corrections.length ? TRACK_SETTLE_MS : 0);
     }
   } catch (err) {
@@ -877,27 +880,61 @@ async function analyzeTracking(notBefore, active) {
   const spanMs = ((TRACK_BLOCKS * PROBE.block) / sr) * 1000;
   // La fenêtre ne doit contenir ni le début de la lecture ni un changement de filtre.
   const start = Math.max(notBefore, ref.sinceMs + 500, S.notchChangedMs + 1500);
+  // Attend que le micro ait enregistré la fenêtre décalée de centerMs ; faux si quelque chose a changé.
+  const recorded = async (centerMs) => {
+    const endMs = start + spanMs + centerMs + 500;
+    while (active() && currentReference()?.key === ref.key && serverNow() < endMs) await sleep(100);
+    const stillSame = S.clients.filter((c) => c.ready && c.slot != null).map((c) => `${c.id}:${c.slot}`).join(',') === readyKey;
+    return currentReference()?.key === ref.key && stillSame && S.notchChangedMs + 1500 <= start;
+  };
+  const toResult = (c, r, centerMs) => ({ client: c.id, name: c.name, detected: r.detected, ms: r.detected ? centerMs + (r.lag / sr) * 1000 : null, psr: r.score, driftPpm: r.drift * 1e6, levelDb: r.level, windows: r.windows });
 
   // Le trajet du micro décale toutes les arrivées d'un même montant, qui dérive et saute parfois de
   // plusieurs dizaines de ms : on cherche autour de la dernière valeur connue, puis plus large.
   let results = null;
   for (const centerMs of [S.trackCenterMs, ...TRACK_SWEEP_MS.map((d) => S.trackCenterMs + d)]) {
-    const endMs = start + spanMs + centerMs + 500;
-    while (active() && currentReference()?.key === ref.key && serverNow() < endMs) await sleep(100);
-    if (!active()) return null;
-    const stillSame = S.clients.filter((c) => c.ready && c.slot != null).map((c) => `${c.id}:${c.slot}`).join(',') === readyKey;
-    if (currentReference()?.key !== ref.key || !stillSame || S.notchChangedMs + 1500 > start) return { waiting: 'la lecture ou les appareils viennent de changer' };
-    const pass = await correlateWindow(start, centerMs, devices, ref);
-    if (pass?.some((r) => r.detected)) {
-      results = pass;
-      break;
+    if (!(await recorded(centerMs))) return active() ? { waiting: 'la lecture ou les appareils viennent de changer' } : null;
+    const analyzer = await correlateWindow(start, centerMs, devices, ref);
+    // GapTracker décide qui est reconnu : l'appareil le plus net sert de référence, l'écart des autres
+    // vient du cumul de leurs dernières fenêtres. Une bande presque vide (restes du filtrage des
+    // autres appareils) ou une arrivée en bord de plage ne compte pas.
+    const out = S.gapTracker.update(analyzer);
+    const pass = devices.map((c) => toResult(c, out.get(c.id), centerMs));
+    if (!pass.some((r) => r.detected)) {
+      results ??= pass;
+      continue;
     }
-    results ??= pass;
+    results = pass;
+    // Entendus dans leur bande mais introuvables près de la référence (pas encore calibrés,
+    // enceinte changée…) : on les cherche plus loin dans la même fenêtre.
+    const audible = devices.filter((c) => out.get(c.id).audible);
+    if (audible.length) {
+      if (!(await recorded(centerMs + Math.max(...WIDE.offsetsMs)))) return active() ? { waiting: 'la lecture ou les appareils viennent de changer' } : null;
+      const passes = [{ offset: 0, analyzer }];
+      for (const d of WIDE.offsetsMs) passes.push({ offset: Math.round((d * sr) / 1000), analyzer: await correlateWindow(start, centerMs + d, audible, ref) });
+      for (const c of audible) {
+        const w = S.gapTracker.widen(c.id, passes);
+        const r = results.find((x) => x.client === c.id);
+        Object.assign(r, w.detected
+          ? { detected: true, wide: true, ms: centerMs + (w.lag / sr) * 1000, psr: w.score, windows: w.windows }
+          : { searching: true, windows: w.windows });
+      }
+    }
+    break;
   }
   results ??= devices.map((c) => ({ client: c.id, name: c.name, detected: false, ms: null, psr: 0, driftPpm: 0, levelDb: null, windows: 1 }));
 
   const found = results.filter((r) => r.detected);
-  if (found.length) S.trackCenterMs = found.reduce((sum, r) => sum + r.ms, 0) / found.length;
+  // Les appareils trouvés de près donnent le décalage commun ; un appareil retrouvé loin d'eux va
+  // être ramené à leur hauteur.
+  const near = found.filter((r) => !r.wide);
+  const anchor = near.length ? near.reduce((sum, r) => sum + r.ms, 0) / near.length : null;
+  if (anchor !== null) S.trackCenterMs = anchor;
+  // Un appareil loin des autres est rattrapé d'un coup, comme par une calibration. Sinon, on ne touche
+  // pas à une calibration correcte : rien en dessous de 2 ms d'écart entre deux appareils (1 ms de
+  // part et d'autre de la moyenne), et des pas de 6 ms au plus.
+  const jumps = found.filter((r) => r.wide && Math.abs(r.ms - anchor) >= WIDE.jumpMs)
+    .map((r) => ({ client: r.client, deltaMs: Math.round((r.ms - anchor) * 10) / 10, jump: true }));
   return {
     calibId: Math.random().toString(36).slice(2),
     mode: 'track',
@@ -905,9 +942,7 @@ async function analyzeTracking(notBefore, active) {
     mic: S.micLabel,
     windowStartMs: start,
     results,
-    // On ne touche pas à une calibration correcte : rien en dessous de 2 ms d'écart entre deux
-    // appareils (1 ms de part et d'autre de la moyenne), et des pas de 6 ms au plus.
-    corrections: gapCorrections(found.map((r) => ({ client: r.client, ms: r.ms })), { deadbandMs: 1, maxStepMs: 6 }),
+    corrections: jumps.length ? jumps : gapCorrections(found.map((r) => ({ client: r.client, ms: r.ms })), { deadbandMs: 1, maxStepMs: 6 }),
   };
 }
 
@@ -929,14 +964,7 @@ async function correlateWindow(start, centerMs, devices, ref) {
     analyzer.addBlock(block, data.subarray(x0, x0 + len), offsetS);
     if (b % 8 === 7) await sleep(0); // laisse respirer l'interface
   }
-  // GapTracker décide qui est reconnu : l'appareil le plus net sert de référence, l'écart des autres
-  // vient du cumul de leurs dernières fenêtres. Une bande presque vide (restes du filtrage des
-  // autres appareils) ou une arrivée en bord de plage ne compte pas.
-  const out = S.gapTracker.update(analyzer);
-  return devices.map((c) => {
-    const r = out.get(c.id);
-    return { client: c.id, name: c.name, detected: r.detected, ms: r.detected ? centerMs + (r.lag / sr) * 1000 : null, psr: r.score, driftPpm: r.drift * 1e6, levelDb: r.level, windows: r.windows };
-  });
+  return analyzer;
 }
 
 // --- Événements serveur -----------------------------------------------------
@@ -983,7 +1011,12 @@ function connectEvents() {
     render();
   });
   on('clients', (d) => { S.clients = d; applyTracking(); render(); });
-  on('tracking', (d) => { S.tracking = d; applyTracking(); render(); });
+  on('tracking', (d) => {
+    if (d.on && !S.tracking?.on) S.lastTrack = null; // un nouveau suivi part de zéro sur toutes les pages
+    S.tracking = d;
+    applyTracking();
+    render();
+  });
   on('live', (d) => { S.live = d; applyLive(); render(); });
   on('track', (d) => { S.track = d; render(); });
   on('playback', (d) => { onPlayback(d); render(); });
@@ -1092,15 +1125,26 @@ function gapOf(res) {
 
 const signed = (v) => `${v >= 0 ? '+' : ''}${fmt(v)}`;
 const nameOf = (res, client) => res.results.find((r) => r.client === client)?.name ?? client;
+const fixesOf = (res) => res.corrections.map((c) => `${nameOf(res, c.client)} ${signed(c.deltaMs)} ms${c.jump ? ' d’un coup' : ''}`).join(', ');
 
 // Valeurs d'une mesure rapportées à un appareil de référence (celui qui écoute s'il est détecté).
 function relativeValues(res) {
   const ok = res.results.filter((r) => r.detected);
-  const ref = ok.find((r) => r.client === res.listener) ?? ok[0];
-  return res.results.map((r) => {
-    const value = !r.detected ? (r.windows > 1 ? `trop faible pour l'instant, cumul en cours (${r.windows})` : 'non détecté') : r === ref ? 'référence' : `${signed(r.ms - ref.ms)} ms`;
-    return `${r.name} ${value}${r.detected && r.windows > 1 ? ` (cumul de ${r.windows} mesures)` : ''}`;
-  }).join(' · ');
+  const ref = ok.find((r) => r.client === res.listener && !r.wide) ?? ok.find((r) => !r.wide) ?? ok[0];
+  return res.results.map((r) => `${r.name} ${trackState(r, ref)}`).join(' · ');
+}
+
+// Ce que le suivi sait d'un appareil, en clair. ref : résultat de l'appareil de référence.
+function trackState(r, ref) {
+  const n = (k) => `${k} mesure${k > 1 ? 's' : ''}`;
+  if (r.detected) {
+    if (r === ref) return 'référence';
+    return `${signed(r.ms - ref.ms)} ms${r.wide ? ' (retrouvé plus loin que prévu)' : r.windows > 1 ? ` (cumul de ${n(r.windows)})` : ''}`;
+  }
+  // Une bande presque vide : l'appareil ne joue pas, ou le micro ne l'entend pas.
+  if (r.levelDb != null && r.levelDb < TRACKING.levelMin) return 'pas entendu par le micro';
+  if (r.searching) return `entendu, position encore inconnue (${n(r.windows)})`;
+  return r.windows > 1 ? `faible, cumul en cours (${n(r.windows)})` : 'non reconnu';
 }
 
 function renderLive() {
@@ -1142,7 +1186,7 @@ function renderTracking() {
       ? 'Aucun appareil reconnu dans la musique : monte le volume ou rapproche les enceintes du micro.'
       : found === 1
         ? `Un seul appareil reconnu (${relativeValues(last)}) : il en faut deux pour mesurer un écart.`
-        : `Dernière mesure à ${new Date(last.at).toLocaleTimeString()} : ${relativeValues(last)}. ${last.corrections.length ? `Corrections : ${last.corrections.map((c) => `${nameOf(last, c.client)} ${signed(c.deltaMs)} ms`).join(', ')}.` : 'Aucune correction nécessaire.'}`;
+        : `Dernière mesure à ${new Date(last.at).toLocaleTimeString()} : ${relativeValues(last)}. ${last.corrections.length ? `Corrections : ${fixesOf(last)}.` : 'Aucune correction nécessaire.'}`;
   }
   $('trackInfo').textContent = info;
 }
@@ -1155,7 +1199,7 @@ function renderHistory() {
     const absolute = h.mode === 'measure' || h.mode === 'probe';
     const values = absolute ? h.results.map((r) => `${r.name} ${r.detected ? `${fmt(r.ms)} ms` : 'non détecté'}`).join(' · ') : relativeValues(h);
     const gap = gapOf(h);
-    const fixes = h.corrections?.length ? `  corrections : ${h.corrections.map((c) => `${nameOf(h, c.client)} ${signed(c.deltaMs)} ms`).join(', ')}` : '';
+    const fixes = h.corrections?.length ? `  corrections : ${fixesOf(h)}` : '';
     return `${new Date(h.at).toLocaleTimeString()}  ${MODE_LABEL[h.mode].padEnd(12)}  ${values}${gap === null ? '' : `  →  écart ${fmt(gap)} ms`}${fixes}`;
   });
   const text = lines.join('\n');

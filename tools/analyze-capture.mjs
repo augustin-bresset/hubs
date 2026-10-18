@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { PROBE, TRACKING, MusicAnalyzer, GapTracker } from '../public/dsp.js';
+import { PROBE, TRACKING, WIDE, MusicAnalyzer, GapTracker } from '../public/dsp.js';
 
 // Sans argument : la salle dont les captures sont les plus récentes (captures/<code de salle>/).
 function latestRoomDir() {
@@ -40,23 +40,37 @@ for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort()
   const rec = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength >> 2);
   const ref = loadTrack(pb.track, sr);
   const devices = meta.clients.filter((c) => c.ready && c.slot != null);
-  const analyzer = new MusicAnalyzer(sr, new Map(devices.map((c) => [c.id, meta.bands[c.slot]])));
-  const block = new Float32Array(PROBE.block), len = PROBE.block + 2 * PROBE.maxLag;
-  for (let b = 0; b < BLOCKS; b++) {
-    const offsetS = (b * PROBE.block) / sr;
-    const q = Math.round((pb.P0 + (meta.windowStartMs + offsetS * 1000 - pb.S0) / 1000) * sr);
-    const heardMs = pb.S0 + (q / sr - pb.P0) * 1000;
-    const x0 = Math.round(((heardMs - meta.firstServerMs + meta.centerMs) / 1000) * sr) - PROBE.maxLag;
-    if (x0 < 0 || x0 + len > rec.length) continue;
-    for (let i = 0; i < PROBE.block; i++) block[i] = ref[(((q + i) % ref.length) + ref.length) % ref.length];
-    analyzer.addBlock(block, rec.subarray(x0, x0 + len), offsetS);
-  }
+  // Analyse de la fenêtre pour ces appareils, les arrivées étant cherchées autour de centerMs.
+  const analyze = (list, centerMs) => {
+    const analyzer = new MusicAnalyzer(sr, new Map(list.map((c) => [c.id, meta.bands[c.slot]])));
+    const block = new Float32Array(PROBE.block), len = PROBE.block + 2 * PROBE.maxLag;
+    for (let b = 0; b < BLOCKS; b++) {
+      const offsetS = (b * PROBE.block) / sr;
+      const q = Math.round((pb.P0 + (meta.windowStartMs + offsetS * 1000 - pb.S0) / 1000) * sr);
+      const heardMs = pb.S0 + (q / sr - pb.P0) * 1000;
+      const x0 = Math.round(((heardMs - meta.firstServerMs + centerMs) / 1000) * sr) - PROBE.maxLag;
+      if (x0 < 0 || x0 + len > rec.length) continue;
+      for (let i = 0; i < PROBE.block; i++) block[i] = ref[(((q + i) % ref.length) + ref.length) % ref.length];
+      analyzer.addBlock(block, rec.subarray(x0, x0 + len), offsetS);
+    }
+    return analyzer;
+  };
+  const analyzer = analyze(devices, meta.centerMs);
   tracker ??= new GapTracker(sr);
   const res = tracker.update(analyzer);
+  // Entendus mais pas trouvés près des autres : recherche élargie, comme le fait la page.
+  const audible = devices.filter((c) => res.get(c.id).audible);
+  const wide = new Map();
+  if (audible.length) {
+    const passes = [{ offset: 0, analyzer }, ...WIDE.offsetsMs.map((d) => ({ offset: Math.round((d * sr) / 1000), analyzer: analyze(audible, meta.centerMs + d) }))];
+    for (const c of audible) wide.set(c.id, tracker.widen(c.id, passes));
+  }
+  const ms = (lag) => `${((lag / sr) * 1000 + meta.centerMs).toFixed(1).padStart(6)} ms`;
   const parts = devices.map((c) => {
-    const r = res.get(c.id);
-    const where = r.detected ? `${((r.lag / sr) * 1000 + meta.centerMs).toFixed(1).padStart(6)} ms` : 'non reconnu';
-    return `${c.name} : ${where}, score ${r.score.toFixed(1).padStart(6)}, niveau ${r.level.toFixed(0).padStart(4)} dB${r.windows > 1 ? `, cumul de ${r.windows} fenêtres` : ''}`;
+    const r = res.get(c.id), w = wide.get(c.id);
+    const where = r.detected ? ms(r.lag) : w?.detected ? `${ms(w.lag)} (recherche élargie)` : 'non reconnu';
+    const far = w && !w.detected ? `, recherche élargie : score ${w.score.toFixed(1)} vers ${ms(w.lag).trim()}` : '';
+    return `${c.name} : ${where}, score ${(w?.detected ? w.score : r.score).toFixed(1).padStart(6)}, niveau ${r.level.toFixed(0).padStart(4)} dB${Math.max(r.windows, w?.windows ?? 0) > 1 ? `, cumul de ${Math.max(r.windows, w?.windows ?? 0)} fenêtres` : ''}${far}`;
   });
   console.log(`${label} | ${parts.join(' | ')}`);
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PROBE, fft, findOnset, makeBandstop, MusicAnalyzer, GapTracker } from '../public/dsp.js';
+import { PROBE, WIDE, fft, findOnset, makeBandstop, MusicAnalyzer, GapTracker } from '../public/dsp.js';
 import { gapCorrections } from '../public/sync.js';
 
 const SR = 48000;
@@ -190,4 +190,65 @@ test('GapTracker : un appareil faible est reconnu en cumulant plusieurs fenêtre
 test('GapTracker : sans rien dans sa bande, un appareil n’est jamais reconnu', () => {
   const tracker = new GapTracker(SR, { scoreMin: 7, refScoreMin: 8, levelMin: -30, minBlocks: 16 });
   for (let i = 0; i < 8; i++) assert.equal(tracker.update(fakeWindow(20 + i, 7 * i, 0)).get('faible').detected, false);
+});
+
+// Micro qui entend plusieurs appareils, chacun seul dans sa bande (les autres l'y retirent).
+// devices : [{ slot, gain, delayMs, music }] ; pad : échantillons de marge avant et après.
+function hear(devices, length, pad, seed = 5) {
+  const slots = devices.map((d) => d.slot);
+  const played = devices.map((d) => ({ ...d, signal: convolve(d.music, makeBandstop(SR, slots.filter((s) => s !== d.slot).map((s) => PROBE.bands[s]))) }));
+  const rand = rng(seed);
+  return Float32Array.from({ length: length + 2 * pad }, (_, i) => {
+    let v = 0.02 * rand();
+    for (const d of played) v += d.gain * at(d.signal, i - pad - (d.delayMs / 1000) * SR + DELAY);
+    return v;
+  });
+}
+
+// Analyse d'une fenêtre de 32 blocs commençant au bloc `from`, arrivées cherchées autour de centerMs.
+function analyzeWindow(music, mic, pad, slots, from, centerMs) {
+  const analyzer = new MusicAnalyzer(SR, new Map(slots.map((s) => [s, PROBE.bands[s]])));
+  const shift = Math.round((centerMs / 1000) * SR);
+  for (let b = 0; b < 32; b++) {
+    const k = (from + b) * PROBE.block, e = pad + k + shift;
+    analyzer.addBlock(music.subarray(k, k + PROBE.block), mic.subarray(e - PROBE.maxLag, e + PROBE.block + PROBE.maxLag), (b * PROBE.block) / SR);
+  }
+  return analyzer;
+}
+
+const widePasses = (music, mic, pad, slots, from, main) => [
+  { offset: 0, analyzer: main },
+  ...WIDE.offsetsMs.map((d) => ({ offset: Math.round((d / 1000) * SR), analyzer: analyzeWindow(music, mic, pad, slots, from, d) })),
+];
+
+test('recherche élargie : un appareil 310 ms en retard sur les autres est retrouvé', () => {
+  const music = makeMusic(6.5), pad = SR;
+  const mic = hear([{ slot: 0, gain: 1, delayMs: 2, music }, { slot: 1, gain: 0.3, delayMs: 312, music }], music.length, pad);
+  const tracker = new GapTracker(SR);
+  const main = analyzeWindow(music, mic, pad, [0, 1], 0, 0);
+  const res = tracker.update(main);
+  assert.ok(res.get(0).detected, 'appareil proche reconnu');
+  assert.ok(!res.get(1).detected && res.get(1).audible, 'appareil lointain entendu, pas reconnu de près');
+  const w = tracker.widen(1, widePasses(music, mic, pad, [1], 0, main));
+  const gapMs = ((w.lag - res.get(0).lag) / SR) * 1000;
+  console.log(`recherche élargie : score ${w.score.toFixed(1)}, écart ${gapMs.toFixed(2)} ms (attendu 310)`);
+  assert.ok(w.detected && Math.abs(gapMs - 310) < 1, JSON.stringify(w));
+});
+
+test('recherche élargie : une musique sans rapport dans une bande ne passe jamais pour un appareil', () => {
+  const windows = 4, music = makeMusic(windows * 5.5 + 1), other = makeMusic(windows * 5.5 + 1, 17), pad = SR;
+  // L'emplacement 1 joue une autre musique, aussi fort que l'emplacement 0 : le micro l'entend, mais
+  // rien ne correspond à la référence.
+  const mic = hear([{ slot: 0, gain: 1, delayMs: 0, music }, { slot: 1, gain: 1, delayMs: 0, music: other }], music.length, pad);
+  const tracker = new GapTracker(SR);
+  const scores = [];
+  for (let n = 0; n < windows; n++) {
+    const from = n * 32, main = analyzeWindow(music, mic, pad, [0, 1], from, 0);
+    const res = tracker.update(main);
+    assert.ok(res.get(0).detected && res.get(1).audible);
+    const w = tracker.widen(1, widePasses(music, mic, pad, [1], from, main));
+    scores.push(w.score);
+    assert.equal(w.detected, false, `fenêtre ${n + 1} : score ${w.score}`);
+  }
+  console.log(`musique sans rapport, scores cumulés : ${scores.map((v) => v.toFixed(1)).join(', ')}`);
 });
