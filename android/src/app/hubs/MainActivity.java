@@ -80,14 +80,36 @@ public class MainActivity extends Activity {
             open(address.getText().toString());
             return true;
         });
-        // Au lancement, on rouvre la dernière salle sans rien demander.
-        if (!STOP.equals(getIntent().getAction()) && !prefs.getString("address", "").isEmpty()) open(prefs.getString("address", ""));
+        // Au lancement, on rouvre la dernière salle sans rien demander, sauf si un lien en désigne une autre.
+        if (!openLink(getIntent()) && !STOP.equals(getIntent().getAction()) && !prefs.getString("address", "").isEmpty()) open(prefs.getString("address", ""));
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         if (STOP.equals(intent.getAction())) close("");
+        else openLink(intent);
+    }
+
+    // Lien hubs://hôte:port/r/CODE, proposé par la page d'une salle ouverte dans le navigateur. N'importe
+    // quelle page peut fabriquer un tel lien : un serveur jamais utilisé demande confirmation.
+    private boolean openLink(Intent intent) {
+        Uri link = intent.getData();
+        if (!Intent.ACTION_VIEW.equals(intent.getAction()) || link == null || !"hubs".equals(link.getScheme()) || link.getHost() == null) return false;
+        String url = "https" + link.toString().substring("hubs".length());
+        String host = Uri.parse(url).getAuthority();
+        Uri last = Uri.parse(prefs.getString("address", ""));
+        if (host.equals(last.getAuthority()) || prefs.contains("cert:" + host)) {
+            open(url);
+            return true;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.link_title)
+                .setMessage(getString(R.string.link_message, host))
+                .setPositiveButton(R.string.open, (dialog, which) -> open(url))
+                .setNegativeButton(R.string.cancel, null)
+                .show();
+        return true;
     }
 
     // "192.168.1.12" -> "https://192.168.1.12:8443/" ; un lien complet est gardé tel quel.
@@ -115,6 +137,8 @@ public class MainActivity extends Activity {
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true); // la page y garde son nom, son identifiant et sa compensation
         settings.setMediaPlaybackRequiresUserGesture(false);
+        // La page s'en sert pour ne pas proposer d'« Ouvrir dans l'application » à l'application elle-même.
+        settings.setUserAgentString(settings.getUserAgentString() + " HubsApp");
         // Le moteur de rendu ne doit pas perdre sa priorité quand l'écran s'éteint.
         web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
         web.setWebViewClient(new Pages());

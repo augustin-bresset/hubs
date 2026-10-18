@@ -173,7 +173,8 @@ async function handle(req, res) {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store', 'X-Boot': BOOT });
     return res.end(String(now()));
   }
-  if (p === '/api/info') return json(res, 200, { urls: lanAddresses().map((ip) => `https://${ip}:${HTTPS_PORT}`) });
+  // Adresses à donner aux autres appareils, et présence de l'application Android (construite à part).
+  if (p === '/api/info') return json(res, 200, { urls: lanAddresses().map((ip) => `https://${ip}:${HTTPS_PORT}`), apk: fs.existsSync(path.join(PUBLIC, 'hubs.apk')) });
 
   if (await auth.handle(req, res, url, { json, readJson })) return;
 

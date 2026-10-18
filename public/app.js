@@ -1104,7 +1104,7 @@ function renderDevices() {
 
 // --- Invitation : lien et code QR de la salle --------------------------------
 
-const invite = { links: [] };
+const invite = { links: [], https: location.protocol === 'https:', apk: false };
 
 function toggleInvite() {
   const open = $('invite').hidden;
@@ -1117,6 +1117,7 @@ function toggleInvite() {
   $('inviteUrl').textContent = invite.links.join(' ou ');
   const notes = [];
   if (invite.links[0].startsWith('https:') && !/\/\/localhost[:/]/.test(invite.links[0])) notes.push("Le certificat du serveur est auto-signé : accepter l'avertissement du navigateur.");
+  if (invite.apk) notes.push("Sur Android, la page propose ensuite l'application, qui garde le son écran éteint.");
   $('inviteHint').textContent = notes.join(' ');
 }
 
@@ -1449,9 +1450,17 @@ async function start() {
   const info = await fetch('/api/info').then((r) => r.json()).catch(() => ({}));
   const lan = isLocal ? info.urls ?? [] : [];
   invite.links = lan.length ? lan.map(link) : [link(location.origin)];
+  invite.apk = !!info.apk;
   $('phoneUrl').textContent = lan.length
     ? `Sur les autres appareils (même Wi-Fi) : ${invite.links.join(' ou ')} — accepter l'avertissement de certificat.`
     : `Lien de la salle, à ouvrir sur chaque appareil : ${invite.links[0]}`;
+  // Navigateur Android : l'application garde le son écran éteint, le navigateur non. Le lien l'ouvre
+  // sur cette salle si elle est installée, sinon télécharge son installateur.
+  if (/Android/i.test(navigator.userAgent) && !/HubsApp/.test(navigator.userAgent) && invite.apk && invite.https) {
+    const fallback = encodeURIComponent(`${location.origin}/hubs.apk`);
+    $('openApp').href = `intent://${location.host}${location.pathname}#Intent;scheme=hubs;package=app.hubs;S.browser_fallback_url=${fallback};end`;
+    $('appHint').hidden = false;
+  }
 
   clockLoop();
   connectEvents();

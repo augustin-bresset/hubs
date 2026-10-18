@@ -114,9 +114,12 @@ android/build.sh publish   # construit android/build/hubs.apk et le dépose dans
 
 - **Installer** : sur le téléphone, ouvrir l'adresse du serveur suivie de `/hubs.apk`
   (`https://…:8443/hubs.apk`) et accepter l'installation depuis le navigateur.
-- **Ouvrir une salle** : saisir l'adresse du serveur (`192.168.1.12:8443`) ou le lien de la salle.
-  L'application montre l'empreinte du certificat, à comparer à celle que le serveur affiche au
-  démarrage ; une fois acceptée, seul ce certificat passe. La dernière salle se rouvre au lancement.
+- **Ouvrir une salle** : depuis le navigateur du téléphone (code QR scanné), la page de la salle
+  propose **Ouvrir dans l'application** ; sinon, saisir dans l'application l'adresse du serveur
+  (`192.168.1.12:8443`) ou le lien de la salle. L'application montre l'empreinte du certificat, à
+  comparer à celle que le serveur affiche au démarrage ; une fois acceptée, seul ce certificat passe.
+  Un lien vers un serveur jamais utilisé demande confirmation. La dernière salle se rouvre au
+  lancement.
 - **Arrêter** : « Retour » laisse le son continuer, comme un lecteur de musique ; « Arrêter » est
   dans la notification.
 - L'application est un appareil distinct du navigateur du même téléphone : elle a son propre nom

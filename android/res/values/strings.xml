@@ -11,6 +11,8 @@
     <string name="cert_trust">Faire confiance</string>
     <string name="cert_refused">Certificat refusé : la salle n\'a pas été ouverte.</string>
     <string name="cancel">Annuler</string>
+    <string name="link_title">Ouvrir cette salle ?</string>
+    <string name="link_message">Un lien demande d\'ouvrir %1$s, un serveur que l\'application n\'a encore jamais utilisé. N\'accepte que si c\'est bien ta salle.</string>
     <string name="channel">Lecture en cours</string>
     <string name="notification_text">Le son continue écran éteint.</string>
     <string name="stop">Arrêter</string>
