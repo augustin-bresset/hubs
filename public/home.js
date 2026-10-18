@@ -10,12 +10,33 @@ const api = async (path, options = {}) => {
   return { status: r.status, ...(await r.json().catch(() => ({}))) };
 };
 
-$('joinForm').onsubmit = (e) => {
-  e.preventDefault();
-  const code = $('code').value.trim().toUpperCase();
-  if (/^[A-Z0-9]{6}$/.test(code)) location.href = `/r/${code}`;
-  else $('code').focus();
+// Code d'une salle saisi tel quel (« abc 234 ») ou pris dans un lien collé (« https://…/r/ABC234 »).
+const codeOf = (text) => {
+  const t = text.trim();
+  const fromLink = t.match(/\/r\/([A-Za-z0-9]{6})(?:[/?#]|$)/);
+  const code = (fromLink ? fromLink[1] : t.replace(/[\s-]/g, '')).toUpperCase();
+  return /^[A-Z0-9]{6}$/.test(code) ? code : null;
 };
+
+$('joinForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const hint = $('joinHint');
+  const code = codeOf($('code').value);
+  hint.classList.add('warn');
+  if (!code) {
+    hint.textContent = 'Un code de salle compte 6 lettres ou chiffres, par exemple K7M2QX.';
+    $('code').focus();
+    return;
+  }
+  const r = await fetch(`/api/rooms/${code}`).catch(() => null);
+  if (r?.ok) {
+    location.href = `/r/${code}`;
+    return;
+  }
+  hint.textContent = !r ? 'Le serveur ne répond pas.' : r.status === 404 ? `Aucune salle ne porte le code ${code}. Le nom d'une salle ne suffit pas : il faut son code, affiché dans la salle et dans « Mes salles ».` : `Salle injoignable (erreur ${r.status}).`;
+  $('code').focus();
+};
+$('code').oninput = () => $('joinHint').classList.remove('warn');
 
 async function renderRooms() {
   const { rooms = [] } = await api('/api/rooms');
@@ -33,7 +54,7 @@ async function renderRooms() {
     code.textContent = room.code;
     title.append(link, code);
     const actions = document.createElement('div');
-    actions.className = 'nudge';
+    actions.className = 'actions';
     const open = document.createElement('a');
     open.className = 'button';
     open.href = `/r/${room.code}`;

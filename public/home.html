@@ -17,10 +17,10 @@
     <section class="card">
       <h2>Rejoindre une salle</h2>
       <form id="joinForm" class="row">
-        <input id="code" maxlength="6" autocomplete="off" autocapitalize="characters" placeholder="Code à 6 caractères" aria-label="Code de la salle">
+        <input id="code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Code à 6 caractères, ou lien" aria-label="Code ou lien de la salle" aria-describedby="joinHint">
         <button class="primary">Rejoindre</button>
       </form>
-      <p class="hint">Aucun compte n'est nécessaire pour rejoindre : le code ou le lien de la salle suffit.</p>
+      <p class="hint" id="joinHint" aria-live="polite">Aucun compte n'est nécessaire pour rejoindre : le code ou le lien de la salle suffit.</p>
     </section>
 
     <section class="card" id="loginCard" hidden>
