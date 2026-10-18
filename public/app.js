@@ -2,6 +2,7 @@ import { makeChirp, detectChirp, median, PROBE, TRACKING, WIDE, makeBandstop, Mu
 import { fitClock, localToServer, serverToLocal, gapCorrections } from './sync.js';
 import { BRAND } from './brand.js';
 import { LIVE, encodeFrame, FrameParser, fitStreamClock, StreamRing } from './live.js';
+import { qrSvg } from './qr.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -429,10 +430,19 @@ function refreshLiveSources() {
 
 const RAW_AUDIO = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
 
+// Retard du direct : celui choisi, ou en automatique la plus grande compensation des appareils plus
+// 0,3 s, le temps qu'il faut au son pour arriver partout avant d'être joué.
+function liveDelayMs() {
+  const chosen = $('liveDelay').value;
+  if (chosen !== 'auto') return Number(chosen);
+  const comps = S.clients.filter((c) => c.ready && c.status).map((c) => c.status.latencyMs);
+  return Math.min(5000, Math.max(700, Math.ceil((Math.max(0, ...comps) + 300) / 100) * 100));
+}
+
 const requestLive = async (body) => (await fetch(`${API}/live/start`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ id: S.id, delayMs: Number($('liveDelay').value), ...body }),
+  body: JSON.stringify({ id: S.id, delayMs: liveDelayMs(), ...body }),
 })).json();
 
 // Hôte : capte la source choisie et l'envoie par tranches au serveur.
@@ -1030,17 +1040,27 @@ function connectEvents() {
 
 const fmt = (v, digits = 1) => (v == null || !Number.isFinite(v) ? '–' : v.toFixed(digits));
 const deviceRows = new Map();
+const SOURCE_LABEL = {
+  navigateur: 'compensation estimée par le navigateur, à calibrer',
+  micro: 'compensation mesurée au micro',
+  suivi: 'compensation ajustée par le suivi',
+  manuelle: 'compensation réglée à la main',
+};
 
 function renderDevices() {
   const box = $('devices');
   const seen = new Set();
+  // Pendant le suivi, sa dernière mesure dit si chaque appareil est entendu, et où.
+  const last = S.tracking?.on ? S.lastTrack : null;
+  const found = last?.results.filter((r) => r.detected) ?? [];
+  const ref = found.find((r) => r.client === last.listener && !r.wide) ?? found.find((r) => !r.wide) ?? found[0];
   for (const c of S.clients) {
     seen.add(c.id);
     let row = deviceRows.get(c.id);
     if (!row) {
       const el = document.createElement('div');
       el.className = 'device';
-      el.innerHTML = '<div class="title"><span class="name"></span><span class="lat"></span></div><div class="meta"></div><div class="nudge"></div>';
+      el.innerHTML = '<div class="title"><span class="dot"></span><span class="name"></span><span class="lat" title="compensation"></span></div><div class="state"></div><div class="meta"></div><div class="nudge"></div>';
       for (const step of [-10, -1, 1, 10]) {
         const b = document.createElement('button');
         b.textContent = `${step > 0 ? '+' : '−'}${Math.abs(step)} ms`;
@@ -1048,16 +1068,31 @@ function renderDevices() {
         el.querySelector('.nudge').append(b);
       }
       box.append(el);
-      row = { el, name: el.querySelector('.name'), lat: el.querySelector('.lat'), meta: el.querySelector('.meta'), nudge: el.querySelector('.nudge') };
+      const part = (cls) => el.querySelector(`.${cls}`);
+      row = { el, dot: part('dot'), name: part('name'), lat: part('lat'), state: part('state'), meta: part('meta'), nudge: part('nudge') };
       deviceRows.set(c.id, row);
     }
     const st = c.status;
     row.name.textContent = c.name + (c.id === S.id ? ' (cet appareil)' : '');
     row.lat.textContent = c.ready && st ? `${fmt(st.latencyMs)} ms` : '';
     row.nudge.hidden = !c.ready;
-    row.meta.textContent = !c.ready || !st
-      ? 'connecté, son pas encore activé'
-      : `compensation ${st.latencySource} · écart ${fmt(st.errMs)} ms · réseau ${fmt(st.rtt)} ms · annoncé par le navigateur ${fmt(st.reportedMs, 0)} ms · ${st.sampleRate} Hz`;
+    // Pastille : verte si l'appareil est calibré (et entendu par le suivi s'il tourne), orange sinon.
+    let state = 'connecté, son pas encore activé', level = '';
+    if (c.ready && st) {
+      state = SOURCE_LABEL[st.latencySource] ?? `compensation : ${st.latencySource}`;
+      level = st.latencySource === 'navigateur' ? 'warn' : 'ok';
+      const heard = last?.results.find((r) => r.client === c.id);
+      if (heard) {
+        state += ` · suivi : ${trackState(heard, ref)}`;
+        level = heard.detected ? 'ok' : 'warn';
+      }
+    }
+    row.dot.className = `dot ${level}`;
+    row.state.textContent = state;
+    row.state.className = `state ${level === 'warn' ? 'warn' : ''}`;
+    // Détails techniques : écart de la lecture à l'horloge commune (pendant la lecture), réseau,
+    // latence que le navigateur croit avoir (souvent fausse en Bluetooth), fréquence de la carte son.
+    row.meta.textContent = c.ready && st ? [st.errMs == null ? null : `lecture ${fmt(st.errMs)} ms`, `réseau ${fmt(st.rtt)} ms`, `latence annoncée ${fmt(st.reportedMs, 0)} ms`, `${st.sampleRate / 1000} kHz`].filter(Boolean).join(' · ') : '';
   }
   for (const [id, row] of deviceRows) {
     if (!seen.has(id)) {
@@ -1065,6 +1100,37 @@ function renderDevices() {
       deviceRows.delete(id);
     }
   }
+}
+
+// --- Invitation : lien et code QR de la salle --------------------------------
+
+const invite = { links: [] };
+
+function toggleInvite() {
+  const open = $('invite').hidden;
+  $('invite').hidden = !open;
+  $('inviteToggle').setAttribute('aria-expanded', String(open));
+  $('inviteToggle').textContent = open ? 'Masquer' : 'Inviter un appareil';
+  if (!open) return;
+  // Le code ne dépend que du lien : il est dessiné une fois.
+  if (!$('qr').firstChild) $('qr').innerHTML = qrSvg(invite.links[0]);
+  $('inviteUrl').textContent = invite.links.join(' ou ');
+  const notes = [];
+  if (invite.links[0].startsWith('https:') && !/\/\/localhost[:/]/.test(invite.links[0])) notes.push("Le certificat du serveur est auto-signé : accepter l'avertissement du navigateur.");
+  $('inviteHint').textContent = notes.join(' ');
+}
+
+async function copyInviteLink() {
+  const button = $('copyLink');
+  try {
+    await navigator.clipboard.writeText(invite.links[0]);
+    button.textContent = 'Lien copié';
+  } catch {
+    // Presse-papiers refusé : on sélectionne le lien pour une copie à la main.
+    getSelection().selectAllChildren($('inviteUrl'));
+    button.textContent = 'Copie refusée : lien sélectionné';
+  }
+  setTimeout(() => { button.textContent = 'Copier le lien'; }, 2000);
 }
 
 function renderCalib() {
@@ -1335,6 +1401,8 @@ $('tracking').onclick = async () => {
   return cmd('tracking', { on: true });
 };
 $('releaseMic').onclick = releaseMic;
+$('inviteToggle').onclick = toggleInvite;
+$('copyLink').onclick = copyInviteLink;
 $('liveSource').onchange = () => { liveSources.picked = true; };
 // Une application lancée entre-temps apparaît dans les sources du direct au retour sur la page.
 window.addEventListener('focus', () => S.ready && refreshLiveSources());
@@ -1378,10 +1446,12 @@ async function start() {
 
   // Lien à ouvrir sur les autres appareils. Depuis localhost, c'est l'adresse du réseau local qu'il faut donner.
   const link = (origin) => `${origin}/r/${ROOM}`;
-  const lan = isLocal ? await fetch('/api/info').then((r) => r.json()).then((d) => d.urls).catch(() => []) : [];
+  const info = await fetch('/api/info').then((r) => r.json()).catch(() => ({}));
+  const lan = isLocal ? info.urls ?? [] : [];
+  invite.links = lan.length ? lan.map(link) : [link(location.origin)];
   $('phoneUrl').textContent = lan.length
-    ? `Sur les autres appareils (même Wi-Fi) : ${lan.map(link).join(' ou ')} — accepter l'avertissement de certificat.`
-    : `Lien de la salle, à ouvrir sur chaque appareil : ${link(location.origin)}`;
+    ? `Sur les autres appareils (même Wi-Fi) : ${invite.links.join(' ou ')} — accepter l'avertissement de certificat.`
+    : `Lien de la salle, à ouvrir sur chaque appareil : ${invite.links[0]}`;
 
   clockLoop();
   connectEvents();

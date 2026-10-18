@@ -74,11 +74,28 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 
 .device { border-top: 1px solid var(--line); padding: 10px 0; }
 .device:first-child { border-top: 0; padding-top: 0; }
-.device .title { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; }
-.device .title .lat { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
-.device .meta { color: var(--muted); font-size: 13px; }
+.device .title { display: flex; align-items: baseline; gap: 8px; font-weight: 600; }
+.device .title .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.device .title .lat { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.device .state { font-size: 14px; }
+.device .state.warn { color: var(--warn); }
+.device .meta { color: var(--muted); font-size: 12px; }
 .device .nudge { display: flex; gap: 6px; margin-top: 6px; }
-.device .nudge button { min-height: 36px; padding: 4px 10px; font-size: 13px; flex: 1; justify-content: center; }
+.device .nudge button { min-height: 36px; padding: 4px 8px; font-size: 13px; flex: 1 1 0; max-width: 84px; justify-content: center; }
+/* Pastille d'état : calé, à surveiller, ou son pas encore activé. */
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); flex: none; align-self: flex-start; margin-top: 7px; }
+.dot.ok { background: var(--good); }
+.dot.warn { background: var(--warn); }
+
+.cardhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.cardhead h2 { margin: 0; }
+button.small, .button.small { min-height: 34px; padding: 4px 10px; font-size: 13px; }
+.invite { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; padding: 0 0 12px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+.invite p { margin: 0 0 6px; }
+.invite-text { flex: 1 1 220px; min-width: 0; }
+.qr { width: 168px; height: 168px; flex: none; border-radius: 8px; overflow: hidden; }
+.qr svg { display: block; width: 100%; height: 100%; }
+.link { overflow-wrap: anywhere; font-size: 14px; }
 
 table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 10px; }
 th, td { text-align: left; padding: 6px 4px; border-top: 1px solid var(--line); }

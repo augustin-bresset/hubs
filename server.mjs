@@ -206,13 +206,16 @@ function listener(req, res) {
 
 // --- Certificat auto-signé (le micro du navigateur exige HTTPS hors localhost) ---
 
+// Adresses IPv4 de cette machine, celles d'un réseau local (Wi-Fi, box) en premier : c'est la
+// première que montre le code QR d'une salle, alors qu'un VPN comme Tailscale (100.x) en ajoute d'autres.
 function lanAddresses() {
   const out = [];
   for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
     if (/^(docker|br-|veth|virbr)/.test(name)) continue;
     for (const a of addrs ?? []) if (a.family === 'IPv4' && !a.internal) out.push(a.address);
   }
-  return out;
+  const local = (ip) => /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip);
+  return [...out.filter(local), ...out.filter((ip) => !local(ip))];
 }
 
 function ensureCert() {
@@ -221,7 +224,10 @@ function ensureCert() {
   const cert = path.join(CERT_DIR, 'cert.pem');
   const stamp = path.join(CERT_DIR, 'ips');
   const wanted = ips.join(',');
-  const upToDate = [key, cert, stamp].every((f) => fs.existsSync(f)) && fs.readFileSync(stamp, 'utf8') === wanted;
+  // Même ensemble d'adresses, dans n'importe quel ordre : le certificat (et son empreinte, que
+  // l'application Android a mémorisée) reste le même.
+  const sameSet = (text) => text.split(',').sort().join(',') === [...ips].sort().join(',');
+  const upToDate = [key, cert, stamp].every((f) => fs.existsSync(f)) && sameSet(fs.readFileSync(stamp, 'utf8'));
   if (!upToDate) {
     fs.mkdirSync(CERT_DIR, { recursive: true });
     execFileSync('openssl', [

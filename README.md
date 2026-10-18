@@ -12,7 +12,7 @@ d'un retard que ni le téléphone ni le navigateur ne connaissent. Hubs mesure d
 qu'on entend vraiment, compense chaque appareil, puis surveille l'écart pendant que la musique joue.
 
 <p align="center">
-  <img src="docs/salle.png" width="560" alt="La page d'une salle : lecture, direct depuis une application, appareils et leur compensation, calibration au micro, suivi continu">
+  <img src="docs/salle.png" width="560" alt="La page d'une salle : lecture, direct depuis une application, invitation par code QR, appareils et leur compensation, calibration au micro, suivi continu">
 </p>
 
 C'est un prototype : un petit serveur sur l'ordinateur, une page web ouverte sur chaque appareil. Rien
@@ -27,7 +27,8 @@ C'est un prototype : un petit serveur sur l'ordinateur, une page web ouverte sur
   sont corrigés au fil de l'eau, sans rien ajouter au son.
 - **Direct** : ce qui joue sur l'ordinateur — une application comme Spotify, un onglet, une entrée
   audio — ressort, synchronisé, sur tous les appareils.
-- **Salles** : une adresse `/r/CODE` par salle, qu'on rejoint sans compte, par un lien.
+- **Salles** : une adresse `/r/CODE` par salle, qu'on rejoint sans compte, par un lien ou en
+  scannant son code QR.
 - **Application Android** : la même page, qui continue de jouer écran éteint.
 
 ## Démarrage rapide
@@ -41,9 +42,10 @@ node server.mjs
 
 1. Sur l'ordinateur, ouvrir <http://localhost:8080>, se connecter (sans identifiants Google, une
    connexion de développement est proposée), créer une salle et l'ouvrir.
-2. Sur les autres appareils, sur le même Wi-Fi, ouvrir le lien `https://…:8443/r/CODE` affiché dans la
-   salle. Le certificat est auto-signé : accepter l'avertissement (hors de `localhost`, le navigateur
-   n'ouvre le micro et le lecteur audio de la page qu'en HTTPS).
+2. Sur les autres appareils, sur le même Wi-Fi, scanner le code QR de la salle (**Inviter un
+   appareil**) ou ouvrir son lien `https://…:8443/r/CODE`. Le certificat est auto-signé : accepter
+   l'avertissement (hors de `localhost`, le navigateur n'ouvre le micro et le lecteur audio de la
+   page qu'en HTTPS).
 3. Cliquer **Rejoindre** sur chaque appareil.
 4. Choisir **Métronome** puis **Lecture** : sans calibration, on entend le décalage entre les clics.
 5. Sur l'ordinateur, **Calibrer**, puis **Vérifier** : l'écart entre appareils doit être proche de 0.
@@ -90,9 +92,10 @@ sur son enceinte). Sources possibles :
   « Cable-direct » et choisir l'entrée « Source-direct » comme source du direct (`off` pour le
   retirer). Sous Windows et macOS, des outils comme VB-Cable ou BlackHole jouent le même rôle.
 
-Le retard (1 s par défaut) sépare la capture de l'écoute : il doit dépasser la plus grande
-compensation des appareils d'environ 0,3 s. Il rend le direct inadapté à qui doit entendre son
-propre geste sans délai : pour mixer, on écoute au casque et la salle suit avec ce retard.
+Le retard sépare la capture de l'écoute : il doit dépasser la plus grande compensation des
+appareils. En automatique (par défaut), il la dépasse de 0,3 s, 0,7 s au moins. Il rend le direct
+inadapté à qui doit entendre son propre geste sans délai : pour mixer, on écoute au casque et la
+salle suit avec ce retard.
 
 Le son voyage en clair et sans compression (environ 1,5 Mbit/s par appareil), via le serveur. Le
 direct est pensé pour un usage personnel, chez soi : à chacun de respecter les conditions des
@@ -222,7 +225,7 @@ mesure sur 205. Le reste est validé par des tests automatiques, en simulation e
 ## Développement
 
 ```sh
-npm test               # traitement du signal, horloges, comptes et salles, direct d'une application
+npm test               # traitement du signal, horloges, code QR, comptes et salles, direct d'une application
 npm install            # une fois, pour les tests suivants (puppeteer-core)
 npm run smoke          # bout en bout dans Chrome sans écran : lecture, calibration, suivi, direct
 npm run smoke:firefox  # le même scénario sous Firefox
@@ -235,7 +238,7 @@ et suivi en boucle interne, capture d'une application remplacée par une fausse.
 | Dossier | Contenu |
 |---|---|
 | `server.mjs`, `server/` | Serveur : fichiers statiques, horloge, comptes (`auth.mjs`), salles (`rooms.mjs`), capture d'une application (`app-audio.mjs`). |
-| `public/` | Pages et traitement du signal : calibration et suivi (`dsp.js`), horloges (`sync.js`), direct (`live.js`), page d'une salle (`app.js`). |
+| `public/` | Pages et traitement du signal : calibration et suivi (`dsp.js`), horloges (`sync.js`), direct (`live.js`), code QR (`qr.js`), page d'une salle (`app.js`). |
 | `android/` | Application Android et son script de construction. |
 | `test/` | Tests unitaires et de bout en bout. |
 | `tools/` | Analyse hors ligne des enregistrements du micro, câble audio virtuel pour Linux. |

@@ -47,22 +47,35 @@
         <div class="row">
           <select id="liveSource" aria-label="Source du direct"></select>
           <select id="liveDelay" aria-label="Retard du direct">
+            <option value="auto" selected>retard automatique</option>
             <option value="700">retard 0,7 s</option>
-            <option value="1000" selected>retard 1 s</option>
+            <option value="1000">retard 1 s</option>
             <option value="1500">retard 1,5 s</option>
             <option value="2500">retard 2,5 s</option>
           </select>
           <button id="liveToggle">Diffuser en direct</button>
         </div>
-        <p class="hint">Application de cet ordinateur, carte son, micro ou onglet : le son capté ici est rejoué, synchronisé, sur tous les appareils de la salle. Une application choisie ici ne s'entend plus directement, seulement par le direct. Le retard doit dépasser la plus grande compensation affichée plus bas, avec 0,3 s de marge.</p>
+        <p class="hint">Application de cet ordinateur, carte son, micro ou onglet : le son capté ici est rejoué, synchronisé, sur tous les appareils de la salle. Une application choisie ici ne s'entend plus directement, seulement par le direct. Le retard doit dépasser la plus grande compensation des appareils : en automatique, il la dépasse de 0,3 s.</p>
       </div>
       <p class="hint" id="liveInfo"></p>
     </section>
 
     <section class="card" id="devicesCard" hidden>
-      <h2>Appareils</h2>
+      <div class="cardhead">
+        <h2>Appareils</h2>
+        <button id="inviteToggle" class="small" aria-expanded="false" aria-controls="invite">Inviter un appareil</button>
+      </div>
+      <div id="invite" class="invite" hidden>
+        <div id="qr" class="qr" role="img" aria-label="Code QR du lien de la salle"></div>
+        <div class="invite-text">
+          <p>Scanne ce code avec l'appareil photo du téléphone, ou ouvre ce lien sur le même Wi-Fi :</p>
+          <p class="mono link" id="inviteUrl"></p>
+          <div class="row"><button id="copyLink" class="small">Copier le lien</button></div>
+          <p class="hint" id="inviteHint"></p>
+        </div>
+      </div>
       <div id="devices"></div>
-      <p class="hint">Compensation = avance appliquée au son de l'appareil pour rattraper sa latence. Les boutons permettent de l'ajuster à l'oreille, y compris à distance.</p>
+      <p class="hint">Compensation : avance donnée au son de chaque appareil pour rattraper sa latence (enceinte Bluetooth comprise). Les boutons l'ajustent à l'oreille, y compris à distance.</p>
     </section>
 
     <section class="card" id="calibCard" hidden>
