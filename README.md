@@ -16,7 +16,8 @@ qu'on entend vraiment, compense chaque appareil, puis surveille l'écart pendant
 </p>
 
 C'est un prototype : un petit serveur sur l'ordinateur, une page web ouverte sur chaque appareil. Rien
-à installer sur les téléphones (une application Android existe pour garder le son écran éteint).
+à installer sur les téléphones ; une [application Android](https://github.com/augustin-bresset/hubs/releases/latest)
+garde en plus le son écran éteint.
 
 ## Ce que ça fait
 
@@ -108,12 +109,10 @@ Dans un navigateur, Android coupe le son d'une page peu après l'extinction de l
 premier plan, processeur et Wi-Fi maintenus éveillés, page tenue pour visible. Elle ne fait que
 cela : synchro, calibration et direct sont ceux de la page.
 
-```sh
-android/build.sh publish   # construit android/build/hubs.apk et le dépose dans public/
-```
-
-- **Installer** : sur le téléphone, ouvrir l'adresse du serveur suivie de `/hubs.apk`
-  (`https://…:8443/hubs.apk`) et accepter l'installation depuis le navigateur.
+- **Installer** : sur le téléphone (Android 10 ou plus récent), télécharger `hubs.apk` depuis la
+  [dernière publication](https://github.com/augustin-bresset/hubs/releases/latest) et accepter
+  l'installation depuis le navigateur. La page d'une salle ouverte dans le navigateur du téléphone
+  y mène aussi (**l'installer**), ou vers l'application construite par le serveur s'il en a une.
 - **Ouvrir une salle** : depuis le navigateur du téléphone (code QR scanné), la page de la salle
   propose **Ouvrir dans l'application** ; sinon, saisir dans l'application l'adresse du serveur
   (`192.168.1.12:8443`) ou le lien de la salle. L'application montre l'empreinte du certificat, à
@@ -125,10 +124,18 @@ android/build.sh publish   # construit android/build/hubs.apk et le dépose dans
 - L'application est un appareil distinct du navigateur du même téléphone : elle a son propre nom
   et sa propre compensation, à calibrer.
 
-Construction sans Gradle : un JDK et le SDK Android (`build-tools;35.0.0`, `platforms;android-35`),
-désignés par `JAVA_HOME` et `ANDROID_HOME` (par défaut `~/Android/jdk-21` et `~/Android/Sdk`).
-Android 10 au minimum. L'APK est signé par une clé de développement créée à la première
-construction ; `HUBS_KEYSTORE` et `HUBS_KEYSTORE_PASS` désignent une autre clé.
+Pour construire l'application soi-même :
+
+```sh
+android/build.sh publish   # construit android/build/hubs.apk et le dépose dans public/
+```
+
+Le serveur la sert alors à `https://…:8443/hubs.apk`. Construction sans Gradle : un JDK et le SDK
+Android (`build-tools;35.0.0`, `platforms;android-35`), désignés par `JAVA_HOME` et `ANDROID_HOME`
+(par défaut `~/Android/jdk-21` et `~/Android/Sdk`). L'APK est signé par une clé de développement
+créée à la première construction ; `HUBS_KEYSTORE` et `HUBS_KEYSTORE_PASS` désignent une autre clé.
+Android ne remplace une application que par une autre signée de la même clé : pour passer de celle
+des publications à la sienne, désinstaller d'abord.
 
 ## Comment ça marche
 
@@ -233,6 +240,7 @@ npm install            # une fois, pour les tests suivants (puppeteer-core)
 npm run smoke          # bout en bout dans Chrome sans écran : lecture, calibration, suivi, direct
 npm run smoke:firefox  # le même scénario sous Firefox
 npm run android        # construit l'application Android
+gh release create v0.1.0 android/build/hubs.apk   # la publie (garder le nom hubs.apk : la page y renvoie)
 ```
 
 Les tests n'émettent aucun son : comptes vérifiés contre un faux fournisseur d'identité, calibration
